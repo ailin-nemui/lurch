@@ -646,7 +646,7 @@ static int lurch_bundle_publish_own(SERVER_REC * server) {
     goto cleanup;
   }
 
-  g_warning("pre_key bundle: ##%s##", bundle_xml);
+  //g_warning("pre_key bundle: ##%s##", bundle_xml);
   //publish_node_bundle_p = xmlnode_from_str(bundle_xml, -1);
   //jabber_pep_publish(js_p, publish_node_bundle_p);
   signal_emit("lurch peppublish bundle", 3, server, uname, bundle_xml);
@@ -956,7 +956,7 @@ static void irssi_lurch_bundle_request_cb(SERVER_REC * server, LmMessage * lmsg,
   void * data_p = g_hash_table_lookup(lurch_bundle_request_ht, id);
   if (data_p) {
     char * xml = lm_message_node_to_string(lmsg->node);
-    g_warning("found lurch_bundle_request with id ##%s##, message: ##%s##", id, xml);
+    g_warning("found lurch_bundle_request with id ##%s##", id);
     g_free(xml);
     
     lurch_bundle_request_cb(server, from,
@@ -1023,7 +1023,7 @@ static int lurch_bundle_request_do(SERVER_REC * server,
 
   lm_message_node_set_attribute(jiq_p->node, "id", req_id);
   //jabber_iq_set_callback(jiq_p, lurch_bundle_request_cb, qmsg_p);
-  g_hash_table_insert(lurch_bundle_request_ht, req_id, qmsg_p);
+  g_hash_table_insert(lurch_bundle_request_ht, g_strdup(req_id), qmsg_p);
 
   signal_emit("xmpp send iq", 2, server, jiq_p);
 
@@ -1956,6 +1956,10 @@ static void lurch_xml_sent_cb(SERVER_REC *server, LmMessage *lmsg)
     return;
   }
 
+  if (lm_message_node_get_raw_mode(lmsg->node)) {
+    return;
+  }
+
   encrypted_node_p = lm_message_node_get_child(lmsg->node, "encrypted");
   if (encrypted_node_p) {
     return;
@@ -2192,7 +2196,6 @@ cleanup:
   g_free(xml);
   g_strfreev(split);
   free(sender);
-  free(xml);
   free(bundle_node_name);
   free(sender_name);
   axc_buf_free(key_decrypted_p);
@@ -2336,7 +2339,6 @@ static char * lurch_expando_encryption_omemo(SERVER_REC * server, WI_ITEM_REC * 
 
 cleanup:
   free(uname);
-  free(new_title);
   axc_context_destroy_all(axc_ctx_p);
   free(db_fn_omemo);
   omemo_devicelist_destroy(dl_p);
@@ -2366,11 +2368,11 @@ static char * lurch_fp_printable_x(const guchar * data, gsize len)
   int i;
   gchar * out = (void *) 0;
 
-  out = g_malloc(len * 2 + len / 4 + 1);
-  for (i = 0; i < len; ++i) {
-    g_snprintf(&out[i * 2 + i / 4], 3, "%02hhx", data[i]);
-    if (i % 4 == 3) {
-      g_snprintf(&out[i * 2 + i / 4 + 2], 2, " ");
+  out = g_malloc(len * 2 + len / 4 + 2);
+  for (i = 1; i < len; ++i) {
+    g_snprintf(&out[(i - 1) * 2 + (i - 1) / 4], 3, "%02hhx", data[i]);
+    if (i % 4 == 0) {
+      g_snprintf(&out[(i - 1) * 2 + (i - 1) / 4 + 2], 2, " ");
     }
   }
   return out;
@@ -2812,8 +2814,49 @@ static void irssi_lurch_send(SERVER_REC * server, const char * from, const char 
   xml_p = mxmlLoadString((void *) 0, xml, MXML_OPAQUE_CALLBACK);
 
   g_warning("sending xml: ##%s##", xml);
-  //signal_emit("xmpp send others", server, /*LmMessage */ message);
 
+  int lm_type = LM_MESSAGE_SUB_TYPE_NOT_SET;
+  const char * type = mxmlElementGetAttr(xml_p, "type");
+  if (!g_strcmp0("chat", type)) {
+    lm_type = LM_MESSAGE_SUB_TYPE_CHAT;
+  } else if (!g_strcmp0("groupchat", type)) {
+    lm_type = LM_MESSAGE_SUB_TYPE_GROUPCHAT;
+  } else if (!g_strcmp0("headline", type)) {
+    lm_type = LM_MESSAGE_SUB_TYPE_HEADLINE;
+  } else {
+    g_warning("[lurch] irssi_lurch_send: unknown sub-type: %s", type);
+  }
+
+  LmMessage * msg = lm_message_new_with_sub_type(mxmlElementGetAttr(xml_p, "to"), LM_MESSAGE_TYPE_MESSAGE, lm_type);
+  lm_message_node_set_attribute(msg->node, "id", mxmlElementGetAttr(xml_p, "id"));
+  lm_message_node_set_raw_mode(msg->node, TRUE);
+
+  GString * str = g_string_sized_new(strlen(xml));
+  mxml_node_t * child = mxmlGetFirstChild(xml_p);
+  mxml_node_t * sibling;
+  for (sibling = child; sibling; sibling = mxmlGetNextSibling(sibling)) {
+    mxml_node_t * next = sibling->next;
+    mxml_node_t * parent = sibling->parent;
+    sibling->parent = NULL;
+    sibling->next = NULL;
+    char * frag = mxmlSaveAllocString(sibling, MXML_NO_CALLBACK);
+    g_string_append(str, frag);
+    free(frag);
+    sibling->parent = parent;
+    sibling->next = next;
+  }
+  lm_message_node_set_value(msg->node, str->str);
+  mxml_node_t * body_node_p = mxmlFindPath(xml_p, "body");
+  if (!body_node_p) {
+    lm_message_node_add_child(msg->node, "body", "[Encrypted with OMEMO]");
+  }
+  char * new_xml = lm_message_node_to_string(msg->node);
+  g_warning("I want to send ##%s##", new_xml);
+  g_free(new_xml);
+  signal_emit("xmpp send message", 2, server, msg);
+
+  g_string_free(str, TRUE);
+  lm_message_unref(msg);
   mxmlRelease(xml_p);
 }
 
@@ -2862,8 +2905,8 @@ void lurch_core_init(void)
   char * dl_ns = (void *) 0;
   GList * accs_l_p = (void *) 0;
 
-  lurch_bundle_request_ht = g_hash_table_new(g_str_hash, g_str_equal);
-  lurch_peprequest_response_ht = g_hash_table_new(g_str_hash, g_str_equal);
+  lurch_bundle_request_ht = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+  lurch_peprequest_response_ht = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
 
   omemo_default_crypto_init();
 
