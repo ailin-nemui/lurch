@@ -1,15 +1,26 @@
+#include "module.h"
+
 #include <glib.h>
 
 #include <inttypes.h>
 #include <string.h>
 #include <time.h>
+#include <mxml.h>
 
-#include <purple.h>
+#include "irssi/src/common.h"
+#include "irssi/src/core/window-item-def.h"
+#include "irssi/src/core/servers.h"
+#include "irssi/src/core/channels.h"
+#include "irssi/src/core/queries.h"
+#include "irssi/src/core/settings.h"
+#include "irssi/src/core/signals.h"
+#include "irssi/src/core/levels.h"
+#include "irssi/src/core/commands.h"
+#include "irssi/src/core/expandos.h"
+#include "irssi/src/core/nicklist.h"
+#include "irssi/src/fe-common/core/printtext.h"
 
-#include "chat.h"
-#include "jabber.h"
-#include "jutil.h"
-#include "pep.h"
+#include "loudmouth/loudmouth.h"
 
 #include "libomemo.h"
 #include "libomemo_crypto.h"
@@ -27,7 +38,7 @@
 #define strnlen(a, b) (MIN(strlen(a), (b)))
 #endif
 
-#define JABBER_PROTOCOL_ID "prpl-jabber"
+#define LURCH_PRE_KEYS_AMOUNT 21
 
 // see https://www.ietf.org/rfc/rfc3920.txt
 #define JABBER_MAX_LEN_NODE 1023
@@ -40,9 +51,9 @@
 #define LURCH_DB_NAME_OMEMO "omemo"
 #define LURCH_DB_NAME_AXC   "axc"
 
-#define LURCH_PREF_ROOT              "/plugins/core/lurch"
-#define LURCH_PREF_AXC_LOGGING       LURCH_PREF_ROOT "/axc_logging"
-#define LURCH_PREF_AXC_LOGGING_LEVEL LURCH_PREF_AXC_LOGGING "/level"
+#define LURCH_PREF_ROOT              "lurch"
+#define LURCH_PREF_AXC_LOGGING       LURCH_PREF_ROOT "_axc_logging"
+#define LURCH_PREF_AXC_LOGGING_LEVEL LURCH_PREF_AXC_LOGGING "_level"
 
 #define LURCH_ERR           -1000000
 #define LURCH_ERR_NOMEM     -1000001
@@ -52,6 +63,11 @@
                                  "You can try again, or try to find the problem by looking at the debug log."
 #define LURCH_ERR_STRING_DECRYPT "There was an error decrypting an OMEMO message addressed to this device. " \
                                  "See the debug log for details."
+
+#define debug_info(a, b, ...) g_warning("[" a "][INFO] " b , ##__VA_ARGS__)
+#define debug_warning(a, b, ...) g_warning("[" a "][WARNING] " b , ##__VA_ARGS__)
+#define debug_error(a, b, ...) g_warning("[" a "][ERROR] " b , ##__VA_ARGS__)
+
 typedef struct lurch_addr {
   char * jid;
   uint32_t device_id;
@@ -70,15 +86,62 @@ omemo_crypto_provider crypto = {
     .aes_gcm_decrypt_func = omemo_default_crypto_aes_gcm_decrypt
 };
 
-int topic_changed = 0;
 int uninstall = 0;
+char * g_dl_ns = (void *) 0;
 
-PurpleCmdId lurch_cmd_id = 0;
+static GHashTable * lurch_bundle_request_ht;
+static GHashTable * lurch_peprequest_response_ht;
 
 static void lurch_addr_list_destroy_func(gpointer data) {
   lurch_addr * addr_p = (lurch_addr *) data;
   free(addr_p->jid);
   free(addr_p);
+}
+
+
+/**
+ * lurch_get_bare_jid:
+ *
+ * @return (transfer full): the bare jid
+ */
+static char * lurch_get_bare_jid(const char * jid)
+{
+  char * resource = strrchr(jid, '/');
+
+  if (resource == NULL) {
+    return g_strdup(jid);
+  } else {
+    return g_strndup(jid, resource - jid);
+  }
+}
+
+static char * lurch_irssi_nick_get_name(SERVER_REC * server, const char * nick)
+{
+  g_return_val_if_fail(server != NULL, NULL);
+
+  if (strchr(nick, '@') != NULL) {
+    return g_strdup(nick);
+  } else {
+    return g_strconcat(nick, "@", (server->connrec->chatnet != NULL ?
+				   server->connrec->chatnet :
+				   server->tag),
+		       NULL);
+  }
+}
+
+static char * lurch_irssi_conversation_get_name(WI_ITEM_REC * item)
+{
+  g_return_val_if_fail(item != NULL, NULL);
+
+  if (strchr(item->name, '@') != NULL) {
+    return g_strdup(item->name);
+  } else {
+    return g_strconcat(item->name, "@", (item->server != NULL ? item->server->connrec->chatnet != NULL ?
+					 item->server->connrec->chatnet :
+					 item->server->tag :
+					 ((QUERY_REC *)item)->server_tag),
+		       NULL);
+  }
 }
 
 /**
@@ -124,7 +187,7 @@ cleanup:
     free(qmsg_p);
   }
   if (err_msg_dbg) {
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     free(err_msg_dbg);
   }
   return ret_val;
@@ -155,19 +218,20 @@ static char * lurch_queue_make_key_string_s(const char * name, const char * devi
  *
  * @param uname The username.
  * @param which Either LURCH_DB_NAME_OMEMO or LURCH_DB_NAME_AXC
- * @return The path string.
+ * @return (transfer full): The path string.
  */
 static char * lurch_uname_get_db_fn(const char * uname, char * which) {
-  return g_strconcat(purple_user_dir(), "/", uname, "_", which, LURCH_DB_SUFFIX, NULL);
+  return g_strconcat(get_irssi_dir(), "/", uname, "_", which, LURCH_DB_SUFFIX, NULL);
 }
 
+static char * lurch_uname_strip(const char * uname) __attribute__((unused));
 /**
  * For some reason pidgin returns account names with a trailing "/".
  * This function removes it.
  * All other functions asking for the username assume the "/" is already stripped.
  *
  * @param uname The username.
- * @return A duplicated string with the trailing "/" removed. free() when done.
+ * @return (transfer full): A duplicated string with the trailing "/" removed. free() when done.
  */
 static char * lurch_uname_strip(const char * uname) {
   char ** split;
@@ -182,6 +246,34 @@ static char * lurch_uname_strip(const char * uname) {
 }
 
 /**
+ * lurch_get_account:
+ *
+ * @return (transfer full) (nullable):  The jabber account jid or the network tag. NULL on error
+ */
+static char * lurch_get_account(SERVER_REC * server, WI_ITEM_REC * item)
+{
+  char * nick;
+  
+  if (item != NULL && item->server != NULL) {
+    server = item->server;
+  }
+  if (server == NULL) {
+    return NULL;
+  }
+
+  nick = server->connrec->nick;
+  if (nick != NULL && strchr(nick, '@') != NULL) {
+    return g_strdup(nick);
+  }
+
+  if (server->connrec->chatnet != NULL) {
+    return g_strconcat(server->connrec->username, "@", server->connrec->chatnet, NULL);
+  }
+
+  return g_strconcat(server->connrec->username, "@", server->tag, NULL);
+}
+
+/**
  * Log wrapper for AXC
  *
  * @param level	an AXC_LOG level
@@ -192,22 +284,22 @@ static char * lurch_uname_strip(const char * uname) {
 static void lurch_axc_log_func(int level, const char * msg, size_t len, void * user_data) {
   switch(level) {
     case AXC_LOG_ERROR:
-      purple_debug_error("lurch", "[AXC ERROR] %s\n", msg);
+      g_warning("lurch" "[AXC ERROR] %s\n", msg);
       break;
     case AXC_LOG_WARNING:
-      purple_debug_warning("lurch", "[AXC WARNING] %s\n", msg);
+      g_warning("lurch" "[AXC WARNING] %s\n", msg);
       break;
     case AXC_LOG_NOTICE:
-      purple_debug_info("lurch", "[AXC NOTICE] %s\n", msg);
+      g_warning("lurch" "[AXC NOTICE] %s\n", msg);
       break;
     case AXC_LOG_INFO:
-      purple_debug_info("lurch", "[AXC INFO] %s\n", msg);
+      g_warning("lurch" "[AXC INFO] %s\n", msg);
       break;
     case AXC_LOG_DEBUG:
-      purple_debug_misc("lurch", "[AXC DEBUG] %s\n", msg);
+      g_warning("lurch" "[AXC DEBUG] %s\n", msg);
       break;
     default:
-      purple_debug_misc("lurch", "[AXC %d] %s\n", level, msg);
+      g_warning("lurch" "[AXC %d] %s\n", level, msg);
       break;
   }
 }
@@ -239,9 +331,9 @@ static int lurch_axc_get_init_ctx(char * uname, axc_context ** ctx_pp) {
     goto cleanup;
   }
 
-  if (purple_prefs_get_bool(LURCH_PREF_AXC_LOGGING)) {
+  if (settings_get_bool(LURCH_PREF_AXC_LOGGING)) {
       axc_context_set_log_func(ctx_p, lurch_axc_log_func);
-      axc_context_set_log_level(ctx_p, purple_prefs_get_int(LURCH_PREF_AXC_LOGGING_LEVEL));
+      axc_context_set_log_level(ctx_p, settings_get_choice(LURCH_PREF_AXC_LOGGING_LEVEL));
   }
 
   ret_val = axc_init(ctx_p);
@@ -250,7 +342,7 @@ static int lurch_axc_get_init_ctx(char * uname, axc_context ** ctx_pp) {
     goto cleanup;
   }
 
-  if (purple_prefs_get_bool(LURCH_PREF_AXC_LOGGING)) {
+  if (settings_get_bool(LURCH_PREF_AXC_LOGGING)) {
     signal_context_set_log_function(axc_context_get_axolotl_ctx(ctx_p), lurch_axc_log_func);
   }
 
@@ -261,7 +353,7 @@ cleanup:
     axc_context_destroy_all(ctx_p);
   }
   if (err_msg_dbg) {
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     free(err_msg_dbg);
   }
 
@@ -329,7 +421,7 @@ static int lurch_axc_prepare(char * uname) {
 
 cleanup:
   if (err_msg_dbg) {
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     free(err_msg_dbg);
   }
   axc_context_destroy_all(axc_ctx_p);
@@ -361,7 +453,7 @@ static int lurch_key_encrypt(const lurch_addr * recipient_addr_p,
   axc_buf * key_ct_buf_p = (void *) 0;
   axc_address axc_addr = {0};
 
-  purple_debug_info("lurch", "%s: encrypting key for %s:%i\n", __func__, recipient_addr_p->jid, recipient_addr_p->device_id);
+  debug_info("lurch", "%s: encrypting key for %s:%i\n", __func__, recipient_addr_p->jid, recipient_addr_p->device_id);
 
   key_buf_p = axc_buf_create(key_p, key_len);
   if (!key_buf_p) {
@@ -386,7 +478,7 @@ cleanup:
     axc_buf_free(key_ct_buf_p);
   }
   if (err_msg_dbg) {
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     free(err_msg_dbg);
   }
   axc_buf_free(key_buf_p);
@@ -413,7 +505,7 @@ static int lurch_msg_encrypt_for_addrs(omemo_message * om_msg_p, GList * addr_l_
   axc_address addr = {0};
   axc_buf * curr_key_ct_buf_p = (void *) 0;
 
-  purple_debug_info("lurch", "%s: trying to encrypt key for %i devices\n", __func__, g_list_length(addr_l_p));
+  debug_info("lurch", "%s: trying to encrypt key for %i devices\n", __func__, g_list_length(addr_l_p));
 
   for (curr_l_p = addr_l_p; curr_l_p; curr_l_p = curr_l_p->next) {
     curr_addr_p = (lurch_addr *) curr_l_p->data;
@@ -454,7 +546,7 @@ static int lurch_msg_encrypt_for_addrs(omemo_message * om_msg_p, GList * addr_l_
 
 cleanup:
   if (err_msg_dbg) {
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     free(err_msg_dbg);
   }
   axc_buf_free(curr_key_ct_buf_p);
@@ -468,7 +560,7 @@ cleanup:
  * @param uname The username.
  * @param js_p Pointer to the connection to use for publishing.
  */
-static int lurch_bundle_publish_own(JabberStream * js_p) {
+static int lurch_bundle_publish_own(SERVER_REC * server) {
   int ret_val = 0;
   char * err_msg_dbg = (void *) 0;
 
@@ -479,9 +571,8 @@ static int lurch_bundle_publish_own(JabberStream * js_p) {
   axc_buf * curr_buf_p = (void *) 0;
   axc_buf_list_item * next_p = (void *) 0;
   char * bundle_xml = (void *) 0;
-  xmlnode * publish_node_bundle_p = (void *) 0;
 
-  uname = lurch_uname_strip(purple_account_get_username(purple_connection_get_account(js_p->gc)));
+  uname = lurch_get_account(server, NULL);
 
   ret_val = lurch_axc_get_init_ctx(uname, &axc_ctx_p);
   if (ret_val) {
@@ -489,7 +580,7 @@ static int lurch_bundle_publish_own(JabberStream * js_p) {
     goto cleanup;
   }
 
-  ret_val = axc_bundle_collect(AXC_PRE_KEYS_AMOUNT, axc_ctx_p, &axcbundle_p);
+  ret_val = axc_bundle_collect(LURCH_PRE_KEYS_AMOUNT, axc_ctx_p, &axcbundle_p);
   if (ret_val) {
     err_msg_dbg = g_strdup_printf("failed to collect axc bundle");
     goto cleanup;
@@ -555,14 +646,16 @@ static int lurch_bundle_publish_own(JabberStream * js_p) {
     goto cleanup;
   }
 
-  publish_node_bundle_p = xmlnode_from_str(bundle_xml, -1);
-  jabber_pep_publish(js_p, publish_node_bundle_p);
+  g_warning("pre_key bundle: ##%s##", bundle_xml);
+  //publish_node_bundle_p = xmlnode_from_str(bundle_xml, -1);
+  //jabber_pep_publish(js_p, publish_node_bundle_p);
+  signal_emit("lurch send bundle", 3, server, uname, bundle_xml);
 
-  purple_debug_info("lurch", "%s: published own bundle for %s\n", __func__, uname);
+  debug_info("lurch", "%s: published own bundle for %s\n", __func__, uname);
 
 cleanup:
   if (err_msg_dbg) {
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     free(err_msg_dbg);
   }
   free(uname);
@@ -601,12 +694,11 @@ static uint32_t lurch_bundle_name_get_device_id(const char * bundle_node_name) {
  */
 static int lurch_bundle_create_session(const char * uname,
                                        const char * from,
-                                       const xmlnode * items_p,
+                                       LmMessageNode * items_p,
                                        axc_context * axc_ctx_p) {
   int ret_val = 0;
   char * err_msg_dbg = (void *) 0;
 
-  int len;
   omemo_bundle * om_bundle_p = (void *) 0;
   axc_address remote_addr = {0};
   uint32_t pre_key_id = 0;
@@ -623,10 +715,12 @@ static int lurch_bundle_create_session(const char * uname,
   axc_buf * signed_pre_key_buf_p = (void *) 0;
   axc_buf * signature_buf_p = (void *) 0;
   axc_buf * identity_key_buf_p = (void *) 0;
+  char * items_xml = (void *) 0;
 
-  purple_debug_info("lurch", "%s: creating a session between %s and %s from a received bundle\n", __func__, uname, from);
+  debug_info("lurch", "%s: creating a session between %s and %s from a received bundle\n", __func__, uname, from);
 
-  ret_val = omemo_bundle_import(xmlnode_to_str(items_p, &len), &om_bundle_p);
+  items_xml = lm_message_node_to_string(items_p);
+  ret_val = omemo_bundle_import(items_xml, &om_bundle_p);
   if (ret_val) {
     err_msg_dbg = g_strdup_printf("failed to import xml into bundle");
     goto cleanup;
@@ -636,7 +730,7 @@ static int lurch_bundle_create_session(const char * uname,
   remote_addr.name_len = strnlen(from, JABBER_MAX_LEN_BARE);
   remote_addr.device_id = omemo_bundle_get_device_id(om_bundle_p);
 
-  purple_debug_info("lurch", "%s: bundle's device id is %i\n", __func__, remote_addr.device_id);
+  debug_info("lurch", "%s: bundle's device id is %i\n", __func__, remote_addr.device_id);
 
   ret_val = omemo_bundle_get_random_pre_key(om_bundle_p, &pre_key_id, &pre_key_p, &pre_key_len);
   if (ret_val) {
@@ -683,9 +777,10 @@ static int lurch_bundle_create_session(const char * uname,
 
 cleanup:
   if (err_msg_dbg) {
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     free(err_msg_dbg);
   }
+  g_free(items_xml);
   omemo_bundle_destroy(om_bundle_p);
   free(pre_key_p);
   free(signed_pre_key_p);
@@ -710,9 +805,9 @@ static int lurch_export_encrypted(omemo_message * om_msg_p, char ** xml_pp) {
  * Implements JabberIqCallback.
  * Callback for a bundle request.
  */
-static void lurch_bundle_request_cb(JabberStream * js_p, const char * from,
-                                    JabberIqType type, const char * id,
-                                    xmlnode * packet_p, gpointer data_p) {
+static void lurch_bundle_request_cb(SERVER_REC * server, const char * from,
+                                    /*JabberIqType*/ int type, const char * id,
+                                    LmMessage * packet_p, gpointer data_p /*=qmsg_p*/) {
   int ret_val = 0;
   char * err_msg_conv = (void *) 0;
   char * err_msg_dbg = (void *) 0;
@@ -723,15 +818,14 @@ static void lurch_bundle_request_cb(JabberStream * js_p, const char * from,
   axc_address addr = {0};
   axc_context * axc_ctx_p = (void *) 0;
   char * recipient = (void *) 0;
-  xmlnode * pubsub_node_p = (void *) 0;
-  xmlnode * items_node_p = (void *) 0;
+  LmMessageNode * pubsub_node_p = (void *) 0;
+  LmMessageNode * items_node_p = (void *) 0;
   int msg_handled = 0;
   char * addr_key = (void *) 0;
   char * msg_xml = (void *) 0;
-  xmlnode * msg_node_p = (void *) 0;
   lurch_queued_msg * qmsg_p = (lurch_queued_msg *) data_p;
 
-  uname = lurch_uname_strip(purple_account_get_username(purple_connection_get_account(js_p->gc)));
+  uname = lurch_get_account(server, NULL);
   recipient = omemo_message_get_recipient_name_bare(qmsg_p->om_msg_p);
 
   if (!from) {
@@ -742,7 +836,7 @@ static void lurch_bundle_request_cb(JabberStream * js_p, const char * from,
   split = g_strsplit(id, "#", 3);
   device_id_str = split[1];
 
-  purple_debug_info("lurch", "%s: %s received bundle update from %s:%s\n", __func__, uname, from, device_id_str);
+  debug_info("lurch", "%s: %s received bundle update from %s:%s\n", __func__, uname, from, device_id_str);
 
   addr.name = from;
   addr.name_len = strnlen(from, JABBER_MAX_LEN_BARE);
@@ -754,19 +848,19 @@ static void lurch_bundle_request_cb(JabberStream * js_p, const char * from,
     goto cleanup;
   }
 
-  if (type == JABBER_IQ_ERROR) {
+  if (type == LM_MESSAGE_SUB_TYPE_ERROR) {
     err_msg_conv = g_strdup_printf("The device %s owned by %s does not have a bundle and will be skipped. "
                                    "The owner should fix this, or remove the device from the list.", device_id_str, from);
 
   } else {
-    pubsub_node_p = xmlnode_get_child(packet_p, "pubsub");
+    pubsub_node_p = lm_message_node_get_child(packet_p->node, "pubsub");
     if (!pubsub_node_p) {
       ret_val = LURCH_ERR;
       err_msg_dbg = "no <pubsub> node in response";
       goto cleanup;
     }
 
-    items_node_p = xmlnode_get_child(pubsub_node_p, "items");
+    items_node_p = lm_message_node_get_child(pubsub_node_p, "items");
     if (!items_node_p) {
       ret_val = LURCH_ERR;
       err_msg_dbg = "no <items> node in response";
@@ -812,27 +906,23 @@ static void lurch_bundle_request_cb(JabberStream * js_p, const char * from,
       goto cleanup;
     }
 
-    msg_node_p = xmlnode_from_str(msg_xml, -1);
-    if (!msg_node_p) {
-      err_msg_dbg = "failed to parse xml from string";
-      ret_val = LURCH_ERR;
-      goto cleanup;
-    }
+    //msg_node_p = xmlnode_from_str(msg_xml, -1);
 
-    purple_debug_info("lurch", "sending encrypted msg\n");
-    purple_signal_emit(purple_plugins_find_with_id("prpl-jabber"), "jabber-sending-xmlnode", js_p->gc, &msg_node_p);
+    debug_info("lurch", "sending encrypted msg\n");
+    signal_emit("lurch send message", 2, server, msg_xml);
+    //purple_signal_emit(purple_plugins_find_with_id("prpl-jabber"), "jabber-sending-xmlnode", ""/*js_p->gc*/, &msg_node_p);
 
     lurch_queued_msg_destroy(qmsg_p);
   }
 
 cleanup:
   if (err_msg_conv) {
-    purple_conv_present_error(recipient, purple_connection_get_account(js_p->gc), err_msg_conv);
+    printtext(server, recipient, MSGLEVEL_CLIENTERROR, "[lurch] %s", err_msg_conv);
     g_free(err_msg_conv);
   }
   if (err_msg_dbg) {
-    purple_conv_present_error(recipient, purple_connection_get_account(js_p->gc), LURCH_ERR_STRING_ENCRYPT);
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    printtext(server, recipient, MSGLEVEL_CLIENTERROR, "[lurch] %s", err_msg_dbg /* LURCH_ERR_STRING_ENCRYPT */);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
   }
 
   free(uname);
@@ -841,8 +931,37 @@ cleanup:
   free(addr_key);
   free(recipient);
   free(msg_xml);
-  if (msg_node_p) {
-    xmlnode_free(msg_node_p);
+    //xmlnode_free(msg_node_p);
+}
+
+typedef void (*PepCallbackFunc)(SERVER_REC *, const char *, LmMessageNode *);
+
+static void irssi_lurch_peprequest_cb(SERVER_REC * server, LmMessage * lmsg, int type, const char * id, const char * from, const char * to)
+{
+  void * callback_p = g_hash_table_lookup(lurch_peprequest_response_ht, id);
+  if (callback_p) {
+    LmMessageNode * items = (void *) 0;
+    LmMessageNode * node = lm_message_node_get_child(lmsg->node, "pubsub");
+    if (node) {
+      items = lm_message_node_get_child(node, "items");
+    }
+    ((PepCallbackFunc)(callback_p))(server, from, items);
+    g_hash_table_remove(lurch_peprequest_response_ht, id);
+  }
+}
+
+static void irssi_lurch_bundle_request_cb(SERVER_REC * server, LmMessage * lmsg, int type, const char * id, const char * from, const char * to)
+{
+  void * data_p = g_hash_table_lookup(lurch_bundle_request_ht, id);
+  if (data_p) {
+    char * xml = lm_message_node_to_string(lmsg->node);
+    g_warning("found lurch_bundle_request with id ##%s##, message: ##%s##", id, xml);
+    g_free(xml);
+    
+    lurch_bundle_request_cb(server, from,
+			    type, id,
+			    lmsg, data_p /*=qmsg_p*/);
+    g_hash_table_remove(lurch_bundle_request_ht, id);
   }
 }
 
@@ -855,51 +974,62 @@ cleanup:
  * @param qmsg_p Pointer to the queued message waiting on (at least) this bundle.
  * @return 0 on success, negative on error.
  */
-static int lurch_bundle_request_do(JabberStream * js_p,
+// TODO
+static int lurch_bundle_request_do(SERVER_REC * server,
                                    const char * to,
                                    uint32_t device_id,
                                    lurch_queued_msg * qmsg_p) {
   int ret_val = 0;
 
-  JabberIq * jiq_p = (void *) 0;
-  xmlnode * pubsub_node_p = (void *) 0;
+  LmMessage * jiq_p = (void *) 0;
+  LmMessageNode * pubsub_node_p = (void *) 0;
   char * device_id_str = (void *) 0;
   char * rand_str = (void *) 0;
   char * req_id = (void *) 0;
   char * bundle_node_name = (void *) 0;
-  xmlnode * items_node_p = (void *) 0;
+  /*xmlnode*/ void * items_node_p = (void *) 0;
+  char * uname = (void *) 0;
 
-  purple_debug_info("lurch", "%s: %s is requesting bundle from %s:%i\n", __func__,
-                    purple_account_get_username(purple_connection_get_account(js_p->gc)), to, device_id);
+  uname = lurch_get_account(server, NULL);
+  debug_info("lurch", "%s: %s is requesting bundle from %s:%i\n", __func__, uname, to, device_id);
 
-  jiq_p = jabber_iq_new(js_p, JABBER_IQ_GET);
-  xmlnode_set_attrib(jiq_p->node, "to", to);
+  jiq_p = lm_message_new_with_sub_type(to, LM_MESSAGE_TYPE_IQ, LM_MESSAGE_SUB_TYPE_GET);
 
-  pubsub_node_p = xmlnode_new_child(jiq_p->node, "pubsub");
-  xmlnode_set_namespace(pubsub_node_p, "http://jabber.org/protocol/pubsub");
+  pubsub_node_p = lm_message_node_add_child(jiq_p->node, "pubsub", NULL);
+  lm_message_node_set_attribute(pubsub_node_p, "xmlns", "http://jabber.org/protocol/pubsub");
 
   device_id_str = g_strdup_printf("%i", device_id);
-  rand_str = g_strdup_printf("%i", g_random_int());
-  req_id = g_strconcat(to, "#", device_id_str, "#", rand_str, NULL);
+  while (1) {
+    char * rand_str = g_strdup_printf("%i", g_random_int());
+    req_id = g_strconcat(to, "#", device_id_str, "#", rand_str, NULL);
+    if (g_hash_table_lookup(lurch_bundle_request_ht, req_id) != NULL) {
+      g_free(rand_str);
+      g_free(req_id);
+      continue;
+    }
+    break;
+  }
 
   ret_val = omemo_bundle_get_pep_node_name(device_id, &bundle_node_name);
   if (ret_val) {
-    purple_debug_error("lurch", "%s: failed to get bundle pep node name for %s:%i\n", __func__, to, device_id);
+    debug_error("lurch", "%s: failed to get bundle pep node name for %s:%i\n", __func__, to, device_id);
     goto cleanup;
   }
 
-  items_node_p = xmlnode_new_child(pubsub_node_p, "items");
-  xmlnode_set_attrib(items_node_p, "node", bundle_node_name);
-  xmlnode_set_attrib(items_node_p, "max_items", "1");
+  items_node_p = lm_message_node_add_child(pubsub_node_p, "items", NULL);
+  lm_message_node_set_attribute(items_node_p, "node", bundle_node_name);
+  lm_message_node_set_attribute(items_node_p, "max_items", "1");
 
-  jabber_iq_set_id(jiq_p, req_id);
-  jabber_iq_set_callback(jiq_p, lurch_bundle_request_cb, qmsg_p);
+  lm_message_node_set_attribute(jiq_p->node, "id", req_id);
+  //jabber_iq_set_callback(jiq_p, lurch_bundle_request_cb, qmsg_p);
+  g_hash_table_insert(lurch_bundle_request_ht, req_id, qmsg_p);
 
-  jabber_iq_send(jiq_p);
+  signal_emit("xmpp send iq", 2, server, jiq_p);
 
-  purple_debug_info("lurch", "%s: ...request sent\n", __func__);
+  debug_info("lurch", "%s: ...request sent\n", __func__);
 
 cleanup:
+  g_free(uname);
   g_free(device_id_str);
   g_free(rand_str);
   g_free(req_id);
@@ -914,7 +1044,8 @@ cleanup:
  * the bundle of the sender is requested and a KeyTransport message is sent
  * in response so that a session can still be established.
  */
-static void lurch_pep_bundle_for_keytransport(JabberStream * js_p, const char * from, xmlnode * items_p) {
+static void lurch_pep_bundle_for_keytransport(SERVER_REC * server, const char * from, LmMessageNode * items_p)
+{
   int ret_val = 0;
   char * err_msg_dbg = (void *) 0;
 
@@ -926,16 +1057,20 @@ static void lurch_pep_bundle_for_keytransport(JabberStream * js_p, const char * 
   lurch_addr laddr = {0};
   axc_buf * key_ct_buf_p = (void *) 0;
   char * msg_xml = (void *) 0;
-  xmlnode * msg_node_p = (void *) 0;
-  void * jabber_handle_p = purple_plugins_find_with_id("prpl-jabber");
+  const char * bundle_node_name = (void *) 0;
 
-  uname = lurch_uname_strip(purple_account_get_username(purple_connection_get_account(js_p->gc)));
+  uname = lurch_get_account(server, NULL);
 
   addr.name = from;
   addr.name_len = strnlen(from, JABBER_MAX_LEN_BARE);
-  addr.device_id = lurch_bundle_name_get_device_id(xmlnode_get_attrib(items_p, "node"));
+  if (!items_p) {
+    err_msg_dbg = g_strdup_printf("invalid xml in bundle");
+    goto cleanup;
+  }
+  bundle_node_name = lm_message_node_get_attribute(items_p, "node");
+  addr.device_id = lurch_bundle_name_get_device_id(bundle_node_name);
 
-  purple_debug_info("lurch", "%s: %s received bundle from %s:%i\n", __func__, uname, from, addr.device_id);
+  debug_info("lurch", "%s: %s received bundle from %s:%i\n", __func__, uname, from, addr.device_id);
 
   laddr.jid = g_strndup(addr.name, addr.name_len);
   laddr.device_id = addr.device_id;
@@ -959,7 +1094,7 @@ static void lurch_pep_bundle_for_keytransport(JabberStream * js_p, const char * 
     goto cleanup;
   }
 
-  purple_debug_info("lurch", "%s: %s created session with %s:%i\n", __func__, uname, from, addr.device_id);
+  debug_info("lurch", "%s: %s created session with %s:%i\n", __func__, uname, from, addr.device_id);
 
   ret_val = axc_get_device_id(axc_ctx_p, &own_id);
   if (ret_val) {
@@ -999,19 +1134,13 @@ static void lurch_pep_bundle_for_keytransport(JabberStream * js_p, const char * 
     goto cleanup;
   }
 
-  msg_node_p = xmlnode_from_str(msg_xml, -1);
-  if (!msg_node_p) {
-    err_msg_dbg = g_strdup_printf("failed to create xml node from xml string");
-    goto cleanup;
-  }
-
-  purple_signal_emit(jabber_handle_p, "jabber-sending-xmlnode", js_p->gc, &msg_node_p);
-  purple_debug_info("lurch", "%s: %s sent keytransportmsg to %s:%i\n", __func__, uname, from, addr.device_id);
+  signal_emit("lurch send keytransport", 3, server, from, msg_xml);
+  debug_info("lurch", "%s: %s sent keytransportmsg to %s:%i\n", __func__, uname, from, addr.device_id);
 
 
 cleanup:
   if (err_msg_dbg) {
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     free(err_msg_dbg);
   }
   free(laddr.jid);
@@ -1020,9 +1149,6 @@ cleanup:
   omemo_message_destroy(msg_p);
   axc_buf_free(key_ct_buf_p);
   free(msg_xml);
-  if (msg_node_p) {
-    xmlnode_free(msg_node_p);
-  }
 }
 
 /**
@@ -1033,7 +1159,8 @@ cleanup:
  * @param js_p Pointer to the JabberStream.
  * @return 0 on success, negative on error.
  */
-static int lurch_devicelist_process(char * uname, omemo_devicelist * dl_in_p, JabberStream * js_p) {
+static int lurch_devicelist_process(char * uname, omemo_devicelist * dl_in_p, /* SERVER_REC */ void * server)
+{
   int ret_val = 0;
   char * err_msg_dbg = (void *) 0;
 
@@ -1052,7 +1179,7 @@ static int lurch_devicelist_process(char * uname, omemo_devicelist * dl_in_p, Ja
   from = omemo_devicelist_get_owner(dl_in_p);
   db_fn_omemo = lurch_uname_get_db_fn(uname, LURCH_DB_NAME_OMEMO);
 
-  purple_debug_info("lurch", "%s: processing devicelist from %s for %s\n", __func__, from, uname);
+  debug_info("lurch", "%s: processing devicelist from %s for %s\n", __func__, from, uname);
 
   ret_val = omemo_storage_user_devicelist_retrieve(from, db_fn_omemo, &dl_db_p);
   if (ret_val) {
@@ -1061,7 +1188,7 @@ static int lurch_devicelist_process(char * uname, omemo_devicelist * dl_in_p, Ja
   }
 
   omemo_devicelist_export(dl_db_p, &debug_str);
-  purple_debug_info("lurch", "%s: %s\n%s\n", __func__, "cached devicelist is", debug_str);
+  debug_info("lurch", "%s: %s\n%s\n", __func__, "cached devicelist is", debug_str);
 
   ret_val = omemo_devicelist_diff(dl_in_p, dl_db_p, &add_l_p, &del_l_p);
   if (ret_val) {
@@ -1071,7 +1198,7 @@ static int lurch_devicelist_process(char * uname, omemo_devicelist * dl_in_p, Ja
 
   for (curr_p = add_l_p; curr_p; curr_p = curr_p->next) {
     curr_id = omemo_devicelist_list_data(curr_p);
-    purple_debug_info("lurch", "%s: saving %i for %s to db %s\n", __func__, curr_id, from, db_fn_omemo);
+    debug_info("lurch", "%s: saving %i for %s to db %s\n", __func__, curr_id, from, db_fn_omemo);
     ret_val = omemo_storage_user_device_id_save(from, curr_id, db_fn_omemo);
     if (ret_val) {
       err_msg_dbg = g_strdup_printf("failed to save %i for %s to %s", curr_id, from, db_fn_omemo);
@@ -1087,7 +1214,7 @@ static int lurch_devicelist_process(char * uname, omemo_devicelist * dl_in_p, Ja
 
   for (curr_p = del_l_p; curr_p; curr_p = curr_p->next) {
     curr_id = omemo_devicelist_list_data(curr_p);
-    purple_debug_info("lurch", "%s: deleting %i for %s to db %s\n", __func__, curr_id, from, db_fn_omemo);
+    debug_info("lurch", "%s: deleting %i for %s to db %s\n", __func__, curr_id, from, db_fn_omemo);
 
     ret_val = omemo_storage_user_device_id_delete(from, curr_id, db_fn_omemo);
     if (ret_val) {
@@ -1098,7 +1225,7 @@ static int lurch_devicelist_process(char * uname, omemo_devicelist * dl_in_p, Ja
 
 cleanup:
   if (err_msg_dbg) {
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     free(err_msg_dbg);
   }
   free(db_fn_omemo);
@@ -1116,34 +1243,27 @@ cleanup:
  * A JabberPEPHandler function.
  * Is used to handle the own devicelist and also perform install-time functions.
  */
-static void lurch_pep_own_devicelist_request_handler(JabberStream * js_p, const char * from, xmlnode * items_p) {
+static void lurch_pep_own_devicelist_request_handler(SERVER_REC * server, const char * from, LmMessageNode * items_p) {
   int ret_val = 0;
   char * err_msg_dbg = (void *) 0;
 
-  int len = 0;
-  PurpleAccount * acc_p = (void *) 0;
   char * uname = (void *) 0;
-  int install = 0;
   axc_context * axc_ctx_p = (void *) 0;
   uint32_t own_id = 0;
   int needs_publishing = 1;
   omemo_devicelist * dl_p = (void *) 0;
   char * dl_xml = (void *) 0;
-  xmlnode * publish_node_dl_p = (void *) 0;
 
-  acc_p = purple_connection_get_account(js_p->gc);
-  uname = lurch_uname_strip(purple_account_get_username(acc_p));
+  uname = lurch_get_account(server, NULL);
 
-  install = (purple_account_get_bool(acc_p, LURCH_ACC_SETTING_INITIALIZED, FALSE)) ? 0 : 1;
-
-  if (install && !uninstall) {
-    purple_debug_info("lurch", "%s: %s\n", __func__, "preparing installation...");
+  if (!uninstall) {
+    debug_info("lurch", "%s: %s\n", __func__, "preparing installation...");
     ret_val = lurch_axc_prepare(uname);
     if (ret_val) {
       err_msg_dbg = g_strdup_printf("failed to prepare axc");
       goto cleanup;
     }
-    purple_debug_info("lurch", "%s: %s\n", __func__, "...done");
+    debug_info("lurch", "%s: %s\n", __func__, "...done");
   }
 
   ret_val = lurch_axc_get_init_ctx(uname, &axc_ctx_p);
@@ -1158,7 +1278,7 @@ static void lurch_pep_own_devicelist_request_handler(JabberStream * js_p, const 
   }
 
   if (!items_p) {
-    purple_debug_info("lurch", "%s: %s\n", __func__, "no devicelist yet, creating it");
+    debug_info("lurch", "%s: %s\n", __func__, "no devicelist yet, creating it");
     ret_val = omemo_devicelist_create(uname, &dl_p);
     if (ret_val) {
       err_msg_dbg = g_strdup_printf("failed to create devicelist");
@@ -1170,8 +1290,10 @@ static void lurch_pep_own_devicelist_request_handler(JabberStream * js_p, const 
       goto cleanup;
     }
   } else {
-    purple_debug_info("lurch", "%s: %s\n", __func__, "comparing received devicelist with cached one");
-    ret_val = omemo_devicelist_import(xmlnode_to_str(items_p, &len), uname, &dl_p);
+    char * items_xml = lm_message_node_to_string(items_p);
+    debug_info("lurch", "%s: %s\n", __func__, "comparing received devicelist with cached one");
+    ret_val = omemo_devicelist_import(items_xml, uname, &dl_p);
+    g_free(items_xml);
     if (ret_val) {
       err_msg_dbg = g_strdup_printf("failed to import received devicelist");
       goto cleanup;
@@ -1179,11 +1301,11 @@ static void lurch_pep_own_devicelist_request_handler(JabberStream * js_p, const 
 
     ret_val = omemo_devicelist_contains_id(dl_p, own_id);
     if (ret_val == 1) {
-      purple_debug_info("lurch", "%s: %s\n", __func__, "own id was already contained in received devicelist, doing nothing");
+      debug_info("lurch", "%s: %s\n", __func__, "own id was already contained in received devicelist, doing nothing");
       needs_publishing = 0;
     } else if (ret_val == 0) {
       if (!uninstall) {
-        purple_debug_info("lurch", "%s: %s\n", __func__, "own id was missing, adding it");
+        debug_info("lurch", "%s: %s\n", __func__, "own id was missing, adding it");
         ret_val = omemo_devicelist_add(dl_p, own_id);
         if (ret_val) {
           err_msg_dbg = g_strdup_printf("failed to add own id %i to devicelist", own_id);
@@ -1200,30 +1322,27 @@ static void lurch_pep_own_devicelist_request_handler(JabberStream * js_p, const 
   }
 
   if (needs_publishing) {
-    purple_debug_info("lurch", "%s: %s\n", __func__, "devicelist needs publishing...");
+    debug_info("lurch", "%s: %s\n", __func__, "devicelist needs publishing...");
     ret_val = omemo_devicelist_export(dl_p, &dl_xml);
     if (ret_val) {
       err_msg_dbg = g_strdup_printf("failed to export new devicelist");
       goto cleanup;
     }
 
-    publish_node_dl_p = xmlnode_from_str(dl_xml, -1);
-    jabber_pep_publish(js_p, publish_node_dl_p);
+    signal_emit("lurch send devicelist", 3, server, from, dl_xml);
+    // publish_node_dl_p = xmlnode_from_str(dl_xml, -1);
+    // jabber_pep_publish(js_p, publish_node_dl_p);
 
-    purple_debug_info("lurch", "%s: \n%s:\n", __func__, "...done");
+    debug_info("lurch", "%s: \n%s:\n", __func__, "...done");
   }
 
-  ret_val = lurch_bundle_publish_own(js_p);
+  ret_val = lurch_bundle_publish_own(server);
   if (ret_val) {
     err_msg_dbg = g_strdup_printf("failed to publish own bundle");
     goto cleanup;
   }
 
-  if (install && !uninstall) {
-    purple_account_set_bool(acc_p, LURCH_ACC_SETTING_INITIALIZED, TRUE);
-  }
-
-  ret_val = lurch_devicelist_process(uname, dl_p, js_p);
+  ret_val = lurch_devicelist_process(uname, dl_p, server);
   if (ret_val) {
     err_msg_dbg = g_strdup_printf("failed to process the devicelist");
     goto cleanup;
@@ -1231,7 +1350,7 @@ static void lurch_pep_own_devicelist_request_handler(JabberStream * js_p, const 
 
 cleanup:
   if (err_msg_dbg) {
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     free(err_msg_dbg);
   }
   g_free(uname);
@@ -1244,30 +1363,30 @@ cleanup:
  * A JabberPEPHandler function.
  * On receiving a devicelist PEP updates the database entry.
  */
-static void lurch_pep_devicelist_event_handler(JabberStream * js_p, const char * from, xmlnode * items_p) {
+static void lurch_pep_devicelist_event_handler(SERVER_REC * server, const char * from, LmMessageNode * items_p) {
   int ret_val = 0;
-  int len = 0;
   char * err_msg_dbg = (void *) 0;
-
+  char * items_xml = (void *) 0;
   char * uname = (void *) 0;
   omemo_devicelist * dl_in_p = (void *) 0;
 
-  uname = lurch_uname_strip(purple_account_get_username(purple_connection_get_account(js_p->gc)));
+  uname = lurch_get_account(server, NULL);
   if (!strncmp(uname, from, strnlen(uname, JABBER_MAX_LEN_BARE))) {
     //own devicelist is dealt with in own handler
-    lurch_pep_own_devicelist_request_handler(js_p, from, items_p);
+    lurch_pep_own_devicelist_request_handler(server, from, items_p);
     goto cleanup;
   }
 
-  purple_debug_info("lurch", "%s: %s received devicelist update from %s\n", __func__, uname, from);
-
-  ret_val = omemo_devicelist_import(xmlnode_to_str(items_p, &len), from, &dl_in_p);
+  debug_info("lurch", "%s: %s received devicelist update from %s\n", __func__, uname, from);
+  items_xml = lm_message_node_to_string(items_p);
+  ret_val = omemo_devicelist_import(items_xml, from, &dl_in_p);
+  g_free(items_xml);
   if (ret_val) {
     err_msg_dbg = g_strdup_printf("failed to import devicelist");
     goto cleanup;
   }
 
-  ret_val = lurch_devicelist_process(uname, dl_in_p, js_p);
+  ret_val = lurch_devicelist_process(uname, dl_in_p, server);
   if(ret_val) {
     err_msg_dbg = g_strdup_printf("failed to process devicelist");
     goto cleanup;
@@ -1275,41 +1394,53 @@ static void lurch_pep_devicelist_event_handler(JabberStream * js_p, const char *
 
 cleanup:
   if (err_msg_dbg) {
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     g_free(err_msg_dbg);
   }
   g_free(uname);
   omemo_devicelist_destroy(dl_in_p);
 }
 
+static void irssi_lurch_iq_cb(SERVER_REC * server, LmMessage * lmsg, int type, const char * id, const char * from, const char * to)
+{
+  LmMessageNode * events = lm_message_node_get_child(lmsg->node, "events");
+  if (events) {
+    LmMessageNode * items = lm_message_node_get_child(events, "items");
+    const char * node = lm_message_node_get_attribute(items, "node");
+    if (g_dl_ns != NULL && !g_strcmp0(node, g_dl_ns)) {
+      lurch_pep_devicelist_event_handler(server, from, items);
+    }
+  }
+}
+
 /**
- * Set as callback for the "account connected" signal.
+ * Set as callback for the "server connected" signal.
  * Requests the own devicelist, as that requires an active connection (as
  * opposed to just registering PEP handlers).
  * Also inits the msg queue hashtable.
  */
-static void lurch_account_connect_cb(PurpleAccount * acc_p) {
+static void lurch_account_connect_cb(SERVER_REC * server)
+{
   int ret_val = 0;
 
   char * uname = (void *) 0;
-  JabberStream * js_p = (void *) 0;
   char * dl_ns = (void *) 0;
 
- // purple_account_set_bool(acc_p, LURCH_ACC_SETTING_INITIALIZED, FALSE);
+  // purple_account_set_bool(acc_p, LURCH_ACC_SETTING_INITIALIZED, FALSE);
 
-  js_p = purple_connection_get_protocol_data(purple_account_get_connection(acc_p));
-
-  if (strncmp(purple_account_get_protocol_id(acc_p), JABBER_PROTOCOL_ID, strlen(JABBER_PROTOCOL_ID))) {
-    return;
-  }
+  //if (strncmp(purple_account_get_protocol_id(acc_p), JABBER_PROTOCOL_ID, strlen(JABBER_PROTOCOL_ID))) {
+  //  return;
+  //}
 
   ret_val = omemo_devicelist_get_pep_node_name(&dl_ns);
   if (ret_val) {
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, "failed to get devicelist pep node name", ret_val);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, "failed to get devicelist pep node name", ret_val);
     goto cleanup;
   }
-  uname = lurch_uname_strip(purple_account_get_username(acc_p));
-  jabber_pep_request_item(js_p, uname, dl_ns, (void *) 0, lurch_pep_own_devicelist_request_handler);
+  uname = lurch_get_account(server, NULL);
+  //jabber_pep_request_item(js_p, uname, dl_ns, (void *) 0, lurch_pep_own_devicelist_request_handler);
+
+  signal_emit("lurch peprequest own_devicelist", 4, server, uname, dl_ns, lurch_pep_own_devicelist_request_handler);
 
 cleanup:
   g_free(uname);
@@ -1327,7 +1458,8 @@ cleanup:
  *                     addresses that do not have a session.
  * @return 0 on success, negative on error.
  */
-static int lurch_axc_sessions_exist(GList * addr_l_p, axc_context * axc_ctx_p, GList ** no_sess_l_pp){
+static int lurch_axc_sessions_exist(GList * addr_l_p, axc_context * axc_ctx_p, GList ** no_sess_l_pp)
+{
   int ret_val = 0;
 
   GList * no_sess_l_p = (void *) 0;
@@ -1344,7 +1476,7 @@ static int lurch_axc_sessions_exist(GList * addr_l_p, axc_context * axc_ctx_p, G
 
     ret_val = axc_session_exists_initiated(&curr_axc_addr, axc_ctx_p);
     if (ret_val < 0) {
-      purple_debug_error("lurch", "%s: %s (%i)\n", __func__, "failed to see if session exists", ret_val);
+      debug_error("lurch", "%s: %s (%i)\n", __func__, "failed to see if session exists", ret_val);
       goto cleanup;
     } else if (ret_val > 0) {
       ret_val = 0;
@@ -1429,13 +1561,12 @@ cleanup:
  * @return 0 on success, negative on error.
  *
  */
-static int lurch_msg_finalize_encryption(JabberStream * js_p, axc_context * axc_ctx_p, omemo_message * om_msg_p, GList * addr_l_p, xmlnode ** msg_stanza_pp) {
+static int lurch_msg_finalize_encryption(SERVER_REC * server, axc_context * axc_ctx_p, omemo_message * om_msg_p, GList * addr_l_p, LmMessage * lmsg) {
   int ret_val = 0;
   char * err_msg_dbg = (void *) 0;
 
   GList * no_sess_l_p = (void *) 0;
   char * xml = (void *) 0;
-  xmlnode * temp_node_p = (void *) 0;
   lurch_queued_msg * qmsg_p = (void *) 0;
   GList * curr_item_p = (void *) 0;
   lurch_addr curr_addr = {0};
@@ -1447,6 +1578,7 @@ static int lurch_msg_finalize_encryption(JabberStream * js_p, axc_context * axc_
   }
 
   if (!no_sess_l_p) {
+    //LmMessageNodeAttribute * a = (void *) 0;
     ret_val = lurch_msg_encrypt_for_addrs(om_msg_p, addr_l_p, axc_ctx_p);
     if (ret_val) {
       err_msg_dbg = g_strdup_printf("failed to encrypt symmetric key for addrs");
@@ -1460,9 +1592,20 @@ static int lurch_msg_finalize_encryption(JabberStream * js_p, axc_context * axc_
     }
 
     omemo_message_destroy(om_msg_p);
-    temp_node_p = xmlnode_from_str(xml, -1);
-    *msg_stanza_pp = temp_node_p;
+    
+    //temp_node_p = xmlnode_from_str(xml, -1);
+    lm_message_node_set_raw_mode(lmsg->node, TRUE);
+    // for (a = lmsg->node->attributes; a; a = a->next) {
+    //   gchar *escaped;
+
+    //   escaped = g_markup_escape_text (a->value, -1);
+    //   g_free(a->value);
+    //   a->value = escaped;
+    // }
+    lm_message_node_set_value(lmsg->node, xml);
+    //*msg_stanza_pp = xml;
   } else {
+    LmMessageNode * l = (void *) 0;
     ret_val = lurch_queued_msg_create(om_msg_p, addr_l_p, no_sess_l_p, &qmsg_p);
     if (ret_val) {
       err_msg_dbg = g_strdup_printf("failed to create queued message");
@@ -1473,22 +1616,28 @@ static int lurch_msg_finalize_encryption(JabberStream * js_p, axc_context * axc_
       curr_addr.jid = ((lurch_addr *)curr_item_p->data)->jid;
       curr_addr.device_id = ((lurch_addr *)curr_item_p->data)->device_id;
 
-      purple_debug_info("lurch", "%s: %s has device without session %i, requesting bundle\n", __func__, curr_addr.jid, curr_addr.device_id);
+      debug_info("lurch", "%s: %s has device without session %i, requesting bundle\n", __func__, curr_addr.jid, curr_addr.device_id);
 
-      lurch_bundle_request_do(js_p,
+      lurch_bundle_request_do(server,
                               curr_addr.jid,
                               curr_addr.device_id,
                               qmsg_p);
 
     }
-    *msg_stanza_pp = (void *) 0;
+    for (l = lmsg->node->children; l; ) {
+        LmMessageNode *next = l->next;
+        lm_message_node_unref(l);
+	l = next;
+    }
+    lmsg->node->children = NULL;
+    //*msg_stanza_pp = (void *) 0;
   }
 
 cleanup:
   if (err_msg_dbg) {
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     free(err_msg_dbg);
-    *msg_stanza_pp = (void *) 0;
+    //*msg_stanza_pp = (void *) 0;
   }
   if (!qmsg_p || ret_val) {
     free(qmsg_p);
@@ -1504,12 +1653,11 @@ cleanup:
  * Set as callback for the "sending xmlnode" signal.
  * Encrypts the message body, if applicable.
  */
-static void lurch_message_encrypt_im(PurpleConnection * gc_p, xmlnode ** msg_stanza_pp) {
+static void lurch_message_encrypt_im(SERVER_REC *server, LmMessage *lmsg)
+{
   int ret_val = 0;
   char * err_msg_dbg = (void *) 0;
-  int len = 0;
 
-  PurpleAccount * acc_p = (void *) 0;
   char * uname = (void *) 0;
   char * db_fn_omemo = (void *) 0;
   const char * to = (void *) 0;
@@ -1524,10 +1672,9 @@ static void lurch_message_encrypt_im(PurpleConnection * gc_p, xmlnode ** msg_sta
   char * recipient = (void *) 0;
   char * tempxml = (void *) 0;
 
-  recipient = jabber_get_bare_jid(xmlnode_get_attrib(*msg_stanza_pp, "to"));
+  recipient = lurch_get_bare_jid(lm_message_node_get_attribute(lmsg->node, "to"));
 
-  acc_p = purple_connection_get_account(gc_p);
-  uname = lurch_uname_strip(purple_account_get_username(acc_p));
+  uname = lurch_get_account(server, NULL);
   db_fn_omemo = lurch_uname_get_db_fn(uname, LURCH_DB_NAME_OMEMO);
 
   ret_val = omemo_storage_chatlist_exists(recipient, db_fn_omemo);
@@ -1535,7 +1682,7 @@ static void lurch_message_encrypt_im(PurpleConnection * gc_p, xmlnode ** msg_sta
     err_msg_dbg = g_strdup_printf("failed to look up %s in DB %s", recipient, db_fn_omemo);
     goto cleanup;
   } else if (ret_val == 1) {
-    purple_debug_info("lurch", "%s: %s is on blacklist, skipping encryption\n", __func__, recipient);
+    debug_info("lurch", "%s: %s is on blacklist, skipping encryption\n", __func__, recipient);
     goto cleanup;
   }
 
@@ -1550,7 +1697,7 @@ static void lurch_message_encrypt_im(PurpleConnection * gc_p, xmlnode ** msg_sta
     err_msg_dbg = g_strdup_printf("failed to get device id");
     goto cleanup;
   }
-  tempxml = xmlnode_to_str(*msg_stanza_pp, &len);
+  tempxml = lm_message_node_to_string(lmsg->node);
   ret_val = omemo_message_prepare_encryption(tempxml, own_id, &crypto, OMEMO_STRIP_ALL, &msg_p);
   if (ret_val) {
     err_msg_dbg = g_strdup_printf("failed to construct omemo message");
@@ -1566,13 +1713,13 @@ static void lurch_message_encrypt_im(PurpleConnection * gc_p, xmlnode ** msg_sta
     goto cleanup;
   }
 
-  free(tempxml);
+  g_free(tempxml);
   ret_val = omemo_devicelist_export(dl_p, &tempxml);
   if(ret_val) {
     err_msg_dbg = g_strdup_printf("failed to export devicelist for %s", to);
     goto cleanup;
   }
-  purple_debug_info("lurch", "retrieved devicelist for %s:\n%s\n", to, tempxml);
+  debug_info("lurch", "retrieved devicelist for %s:\n%s\n", to, tempxml);
 
   recipient_dl_p = omemo_devicelist_get_id_list(dl_p);
   if (!recipient_dl_p) {
@@ -1581,8 +1728,8 @@ static void lurch_message_encrypt_im(PurpleConnection * gc_p, xmlnode ** msg_sta
       err_msg_dbg = g_strdup_printf("failed to check if session exists for %s in %s's db\n", to, uname);
       goto cleanup;
     } else if (ret_val == 1) {
-      purple_conv_present_error(recipient, purple_connection_get_account(gc_p), "Even though an encrypted session exists, the recipient's devicelist is empty."
-                                                                                "The user probably uninstalled OMEMO, so you can add this conversation to the blacklist.");
+      printtext(server, recipient, MSGLEVEL_CLIENTNOTICE, "[lurch] %s", "Even though an encrypted session exists, the recipient's devicelist is empty."
+		"The user probably uninstalled OMEMO, so you can add this conversation to the blacklist.");
     } else {
       goto cleanup;
     }
@@ -1594,7 +1741,7 @@ static void lurch_message_encrypt_im(PurpleConnection * gc_p, xmlnode ** msg_sta
     goto cleanup;
   }
   omemo_devicelist_export(user_dl_p, &tempxml);
-  purple_debug_info("lurch", "retrieved own devicelist:\n%s\n", tempxml);
+  debug_info("lurch", "retrieved own devicelist:\n%s\n", tempxml);
   own_dl_p = omemo_devicelist_get_id_list(user_dl_p);
   if (!own_dl_p) {
     err_msg_dbg = g_strdup_printf("no own devicelist");
@@ -1606,7 +1753,7 @@ static void lurch_message_encrypt_im(PurpleConnection * gc_p, xmlnode ** msg_sta
     addr_l_p = lurch_addr_list_add(addr_l_p, dl_p, (void *) 0);
   }
 
-  ret_val = lurch_msg_finalize_encryption(purple_connection_get_protocol_data(gc_p), axc_ctx_p, msg_p, addr_l_p, msg_stanza_pp);
+  ret_val = lurch_msg_finalize_encryption(server, axc_ctx_p, msg_p, addr_l_p, lmsg);
   if (ret_val) {
     err_msg_dbg = g_strdup_printf("failed to finalize omemo message");
     goto cleanup;
@@ -1614,10 +1761,10 @@ static void lurch_message_encrypt_im(PurpleConnection * gc_p, xmlnode ** msg_sta
 
 cleanup:
   if (err_msg_dbg) {
-    purple_conv_present_error(recipient, purple_connection_get_account(gc_p), LURCH_ERR_STRING_ENCRYPT);
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    printtext(server, recipient, MSGLEVEL_CLIENTERROR, "[lurch] %s", err_msg_dbg /* LURCH_ERR_STRING_ENCRYPT */);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     free(err_msg_dbg);
-    *msg_stanza_pp = (void *) 0;
+    //*msg_stanza_pp = (void *) 0;
   }
   if (ret_val) {
     omemo_message_destroy(msg_p);
@@ -1634,10 +1781,10 @@ cleanup:
   free(tempxml);
 }
 
-static void lurch_message_encrypt_groupchat(PurpleConnection * gc_p, xmlnode ** msg_stanza_pp) {
+static void lurch_message_encrypt_groupchat(SERVER_REC *server, LmMessage *lmsg)
+{
   int ret_val = 0;
   char * err_msg_dbg = (void *) 0;
-  int len;
 
   char * uname = (void *) 0;
   char * db_fn_omemo = (void *) 0;
@@ -1647,18 +1794,17 @@ static void lurch_message_encrypt_groupchat(PurpleConnection * gc_p, xmlnode ** 
   omemo_message * om_msg_p = (void *) 0;
   omemo_devicelist * user_dl_p = (void *) 0;
   GList * addr_l_p = (void *) 0;
-  PurpleConversation * conv_p = (void *) 0;
-  PurpleConvChat * chat_p = (void *) 0;
-  JabberChat * muc_p = (void *) 0;
-  JabberChatMember * curr_muc_member_p = (void *) 0;
-  xmlnode * body_node_p = (void *) 0;
+  CHANNEL_REC * conv_p = (void *) 0;
+  NICK_REC * curr_muc_member_p = (void *) 0;
+  LmMessageNode * body_node_p = (void *) 0;
   GList * curr_item_p = (void *) 0;
   char * curr_muc_member_jid = (void *) 0;
+  char * curr_muc_member_jid_bare = (void *) 0;
   omemo_devicelist * curr_dl_p = (void *) 0;
 
-  const char * to = xmlnode_get_attrib(*msg_stanza_pp, "to");
+  const char * to = lm_message_node_get_attribute(lmsg->node, "to");
 
-  uname = lurch_uname_strip(purple_account_get_username(purple_connection_get_account(gc_p)));
+  uname = lurch_get_account(server, NULL);
   db_fn_omemo = lurch_uname_get_db_fn(uname, LURCH_DB_NAME_OMEMO);
 
   ret_val = omemo_storage_chatlist_exists(to, db_fn_omemo);
@@ -1680,7 +1826,7 @@ static void lurch_message_encrypt_groupchat(PurpleConnection * gc_p, xmlnode ** 
     err_msg_dbg = g_strdup_printf("failed to get device id");
     goto cleanup;
   }
-  tempxml = xmlnode_to_str(*msg_stanza_pp, &len);
+  tempxml = lm_message_node_to_string(lmsg->node);
   ret_val = omemo_message_prepare_encryption(tempxml, own_id, &crypto, OMEMO_STRIP_ALL, &om_msg_p);
   if (ret_val) {
     err_msg_dbg = g_strdup_printf("failed to construct omemo message");
@@ -1695,28 +1841,25 @@ static void lurch_message_encrypt_groupchat(PurpleConnection * gc_p, xmlnode ** 
 
   addr_l_p = lurch_addr_list_add(addr_l_p, user_dl_p, &own_id);
 
-  conv_p = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, to, purple_connection_get_account(gc_p));
+  conv_p = channel_find(server, to);
   if (!conv_p) {
     err_msg_dbg = g_strdup_printf("could not find groupchat %s", to);
     goto cleanup;
   }
 
-  chat_p = purple_conversation_get_chat_data(conv_p);
-  muc_p = jabber_chat_find_by_conv(conv_p);
-  if (!muc_p) {
-    err_msg_dbg = g_strdup_printf("could not find muc struct for groupchat %s", to);
-    goto cleanup;
-  }
+  for (curr_item_p = g_hash_table_get_values(conv_p->nicks); curr_item_p; curr_item_p = curr_item_p->next) {
+    curr_muc_member_p = (NICK_REC *) curr_item_p->data;
+    curr_muc_member_jid = strchr(to, '@') != NULL ? g_strdup(curr_muc_member_p->host) : lurch_irssi_nick_get_name(server, curr_muc_member_p->nick);
+    curr_muc_member_jid_bare = lurch_get_bare_jid(curr_muc_member_jid);
 
-  for (curr_item_p = g_hash_table_get_values(muc_p->members); curr_item_p; curr_item_p = curr_item_p->next) {
-    curr_muc_member_p = (JabberChatMember *) curr_item_p->data;
-    curr_muc_member_jid = jabber_get_bare_jid(curr_muc_member_p->jid);
-
-    if (!curr_muc_member_jid) {
-      err_msg_dbg = g_strdup_printf("Could not find the JID for %s - the channel needs to be non-anonymous!", curr_muc_member_p->handle);
-      purple_conv_present_error(purple_conversation_get_name(conv_p), purple_connection_get_account(gc_p), err_msg_dbg);
+    if (!g_strcmp0(to, curr_muc_member_jid_bare)) {
+      err_msg_dbg = g_strdup_printf("Could not find the JID for %s - the channel needs to be non-anonymous!", curr_muc_member_p->nick);
+      printtext(server, to, MSGLEVEL_CLIENTERROR, "[lurch] %s", err_msg_dbg);
       g_free(err_msg_dbg);
       err_msg_dbg = (void *) 0;
+
+      g_free(curr_muc_member_jid_bare);
+      g_free(curr_muc_member_jid);
       continue;
     }
 
@@ -1724,15 +1867,23 @@ static void lurch_message_encrypt_groupchat(PurpleConnection * gc_p, xmlnode ** 
     // but encrypting and decrypting for yourself should not be done with the double ratchet, so the own device is skipped
     // and the typed message written to the chat window manually without sending
     if (!g_strcmp0(curr_muc_member_jid, uname)) {
-      body_node_p = xmlnode_get_child(*msg_stanza_pp, "body");
+      body_node_p = lm_message_node_get_child(lmsg->node, "body");
 
-      purple_conv_chat_write(chat_p, curr_muc_member_p->handle, xmlnode_get_data(body_node_p), PURPLE_MESSAGE_SEND, time((void *) 0));
+      if (body_node_p) {
+	signal_emit("message xmpp own_public", 3, server, lm_message_node_get_value(body_node_p), conv_p->name);
+      }
+      
+      g_free(curr_muc_member_jid_bare);
+      g_free(curr_muc_member_jid);
       continue;
     }
 
     ret_val = omemo_storage_user_devicelist_retrieve(curr_muc_member_jid, db_fn_omemo, &curr_dl_p);
     if (ret_val) {
       err_msg_dbg = g_strdup_printf("Could not retrieve the devicelist for %s from %s", curr_muc_member_jid, db_fn_omemo);
+
+      g_free(curr_muc_member_jid_bare);
+      g_free(curr_muc_member_jid);
       goto cleanup;
     }
 
@@ -1740,33 +1891,39 @@ static void lurch_message_encrypt_groupchat(PurpleConnection * gc_p, xmlnode ** 
       err_msg_dbg = g_strdup_printf("User %s is no OMEMO user (does not have a devicelist). "
                                     "This user cannot read any incoming encrypted messages and will send his own messages in the clear!",
                                     curr_muc_member_jid);
-      purple_conv_present_error(purple_conversation_get_name(conv_p), purple_connection_get_account(gc_p), err_msg_dbg);
+      printtext(server, to, MSGLEVEL_CLIENTERROR, "[lurch] %s", err_msg_dbg);
       g_free(err_msg_dbg);
       err_msg_dbg = (void *) 0;
+
+      g_free(curr_muc_member_jid_bare);
+      g_free(curr_muc_member_jid);
       continue;
     }
 
     addr_l_p = lurch_addr_list_add(addr_l_p, curr_dl_p, (void *) 0);
     omemo_devicelist_destroy(curr_dl_p);
     curr_dl_p = (void *) 0;
+
+    g_free(curr_muc_member_jid_bare);
+    g_free(curr_muc_member_jid);
   }
 
-  ret_val = lurch_msg_finalize_encryption(purple_connection_get_protocol_data(gc_p), axc_ctx_p, om_msg_p, addr_l_p, msg_stanza_pp);
+  ret_val = lurch_msg_finalize_encryption(server, axc_ctx_p, om_msg_p, addr_l_p, lmsg);
   if (ret_val) {
     err_msg_dbg = g_strdup_printf("failed to finalize msg");
     goto cleanup;
   }
 
   //TODO: properly handle this instead of removing the body completely, necessary for full EME support
-  body_node_p = xmlnode_get_child(*msg_stanza_pp, "body");
-  xmlnode_free(body_node_p);
+  lm_message_node_set_value(lm_message_node_get_child(lmsg->node, "body"), "[Encrypted with OMEMO]");
+
 
 cleanup:
   if (err_msg_dbg) {
-    purple_conv_present_error(purple_conversation_get_name(conv_p), purple_connection_get_account(gc_p), LURCH_ERR_STRING_ENCRYPT);
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    printtext(server, to, MSGLEVEL_CLIENTERROR, "[lurch] %s", err_msg_dbg /* LURCH_ERR_STRING_ENCRYPT */);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     free(err_msg_dbg);
-    *msg_stanza_pp = (void *) 0;
+    //*msg_stanza_pp = (void *) 0;
   }
   if (ret_val) {
     omemo_message_destroy(om_msg_p);
@@ -1776,36 +1933,34 @@ cleanup:
   free(uname);
   free(db_fn_omemo);
   axc_context_destroy_all(axc_ctx_p);
-  free(tempxml);
+  g_free(tempxml);
   omemo_devicelist_destroy(user_dl_p);
 }
 
-static void lurch_xml_sent_cb(PurpleConnection * gc_p, xmlnode ** stanza_pp) {
-  xmlnode * body_node_p = (void *) 0;
-  xmlnode * encrypted_node_p = (void *) 0;
-  char * node_name = (*stanza_pp)->name;
-  const char * type = xmlnode_get_attrib(*stanza_pp, "type");
+static void lurch_xml_sent_cb(SERVER_REC *server, LmMessage *lmsg)
+{
+  LmMessageNode * body_node_p = (void *) 0;
+  LmMessageNode * encrypted_node_p = (void *) 0;
+  int type = lm_message_get_sub_type(lmsg);
 
   if (uninstall) {
     return;
   }
 
-  if (!g_strcmp0(node_name, "message")) {
-    body_node_p = xmlnode_get_child(*stanza_pp, "body");
-    if (!body_node_p) {
-      return;
-    }
+  body_node_p = lm_message_node_get_child(lmsg->node, "body");
+  if (!body_node_p) {
+    return;
+  }
 
-    encrypted_node_p = xmlnode_get_child(*stanza_pp, "encrypted");
-    if (encrypted_node_p) {
-      return;
-    }
+  encrypted_node_p = lm_message_node_get_child(lmsg->node, "encrypted");
+  if (encrypted_node_p) {
+    return;
+  }
 
-    if (!g_strcmp0(type, "chat")) {
-      lurch_message_encrypt_im(gc_p, stanza_pp);
-    } else if (!g_strcmp0(type, "groupchat")) {
-      lurch_message_encrypt_groupchat(gc_p, stanza_pp);
-    }
+  if (type == LM_MESSAGE_SUB_TYPE_CHAT) {
+    lurch_message_encrypt_im(server, lmsg);
+  } else if (type == LM_MESSAGE_SUB_TYPE_GROUPCHAT) {
+    lurch_message_encrypt_groupchat(server, lmsg);
   }
 }
 
@@ -1813,10 +1968,9 @@ static void lurch_xml_sent_cb(PurpleConnection * gc_p, xmlnode ** stanza_pp) {
  * Callback for the "receiving xmlnode" signal.
  * Decrypts message, if applicable.
  */
-static void lurch_message_decrypt(PurpleConnection * gc_p, xmlnode ** msg_stanza_pp) {
+static void lurch_message_decrypt(SERVER_REC * server, LmMessage * lmsg, int type, const char * id, const char * from, const char * to) {
   int ret_val = 0;
   char * err_msg_dbg = (void *) 0;
-  int len;
 
   omemo_message * msg_p = (void *) 0;
   char * uname = (void *) 0;
@@ -1836,41 +1990,39 @@ static void lurch_message_decrypt(PurpleConnection * gc_p, xmlnode ** msg_stanza
   char ** split = (void *) 0;
   char * room_name = (void *) 0;
   char * buddy_nick = (void *) 0;
-  xmlnode * plaintext_msg_node_p = (void *) 0;
+  mxml_node_t * plaintext_msg_node_p = (void *) 0;
+  mxml_node_t * body_node_p = (void *) 0;
+  LmMessageNode * lm_body_node_p = (void *) 0;
   char * recipient_bare_jid = (void *) 0;
-  PurpleConversation * conv_p = (void *) 0;
-  JabberChat * muc_p = (void *) 0;
-  JabberChatMember * muc_member_p = (void *) 0;
-
-  const char * type = xmlnode_get_attrib(*msg_stanza_pp, "type");
-  const char * from = xmlnode_get_attrib(*msg_stanza_pp, "from");
-  const char * to   = xmlnode_get_attrib(*msg_stanza_pp, "to");
+  CHANNEL_REC * conv_p = (void *) 0;
+  NICK_REC * muc_member_p = (void *) 0;
 
   if (uninstall) {
     goto cleanup;
   }
 
-  uname = lurch_uname_strip(purple_account_get_username(purple_connection_get_account(gc_p)));
+  uname = lurch_get_account(server, NULL);
   db_fn_omemo = lurch_uname_get_db_fn(uname, LURCH_DB_NAME_OMEMO);
 
   // on prosody and possibly other servers, messages to the own account do not have a recipient
   if (!to) {
     recipient_bare_jid = g_strdup(uname);
   } else {
-    recipient_bare_jid = jabber_get_bare_jid(to);
+    recipient_bare_jid = lurch_get_bare_jid(to);
   }
 
-  if (!g_strcmp0(type, "chat")) {
-    sender = jabber_get_bare_jid(from);
+  if (type == LM_MESSAGE_SUB_TYPE_CHAT) {
+    sender = lurch_get_bare_jid(from);
 
     ret_val = omemo_storage_chatlist_exists(sender, db_fn_omemo);
     if (ret_val < 0) {
       err_msg_dbg = g_strdup_printf("failed to look up %s in %s", sender, db_fn_omemo);
       goto cleanup;
     } else if (ret_val == 1) {
-      purple_conv_present_error(sender, purple_connection_get_account(gc_p), "Received encrypted message in blacklisted conversation.");
+      printtext(server, from, MSGLEVEL_CLIENTNOTICE, "[lurch] %s", "Received encrypted message in blacklisted conversation.");
     }
-  } else if (!g_strcmp0(type, "groupchat")) {
+  } else if (type == LM_MESSAGE_SUB_TYPE_GROUPCHAT) {
+    char * buddy_jid = (void *) 0;
     split = g_strsplit(from, "/", 2);
     room_name = split[0];
     buddy_nick = split[1];
@@ -1880,36 +2032,35 @@ static void lurch_message_decrypt(PurpleConnection * gc_p, xmlnode ** msg_stanza
       err_msg_dbg = g_strdup_printf("failed to look up %s in %s", room_name, db_fn_omemo);
       goto cleanup;
     } else if (ret_val == 0) {
-      purple_conv_present_error(room_name, purple_connection_get_account(gc_p), "Received encrypted message in non-OMEMO room.");
+      printtext(server, from, MSGLEVEL_CLIENTNOTICE, "[lurch] %s", "Received encrypted message in non-OMEMO room.");
     }
 
-    conv_p = purple_find_conversation_with_account(PURPLE_CONV_TYPE_CHAT, room_name, purple_connection_get_account(gc_p));
+    conv_p = channel_find(server, room_name);
     if (!conv_p) {
       err_msg_dbg = g_strdup_printf("could not find groupchat %s", room_name);
       goto cleanup;
     }
 
-    muc_p = jabber_chat_find_by_conv(conv_p);
-    if (!muc_p) {
-      err_msg_dbg = g_strdup_printf("could not find muc struct for groupchat %s", room_name);
-      goto cleanup;
-    }
-
-    muc_member_p = g_hash_table_lookup(muc_p->members, buddy_nick);
+    muc_member_p = nicklist_find(conv_p, buddy_nick);
     if (!muc_member_p) {
-      purple_debug_misc("lurch", "Received OMEMO message in MUC %s, but the sender %s is not present in the room, which can happen during history catchup. Skipping.\n", room_name, buddy_nick);
+      debug_info("lurch", "Received OMEMO message in MUC %s, but the sender %s is not present in the room, which can happen during history catchup. Skipping.\n", room_name, buddy_nick);
       goto cleanup;
     }
 
-    if (!muc_member_p->jid) {
+    buddy_jid = strchr(room_name, '@') != NULL ? g_strdup(muc_member_p->host) : lurch_irssi_nick_get_name(server, muc_member_p->nick);
+    sender = lurch_get_bare_jid(buddy_jid);
+    g_free(buddy_jid);
+
+    if (!g_strcmp0(sender, room_name)) {
       err_msg_dbg = g_strdup_printf("jid for user %s in muc %s not found, is the room anonymous?", buddy_nick, room_name);
       goto cleanup;
     }
-
-    sender = jabber_get_bare_jid(muc_member_p->jid);
   }
 
-  ret_val = omemo_message_prepare_decryption(xmlnode_to_str(*msg_stanza_pp, &len), &msg_p);
+  xml = lm_message_node_to_string(lmsg->node);
+  ret_val = omemo_message_prepare_decryption(xml, &msg_p);
+  g_free(xml);
+  xml = (void *) 0;
   if (ret_val) {
     err_msg_dbg = g_strdup_printf("failed import msg for decryption");
     goto cleanup;
@@ -1933,7 +2084,7 @@ static void lurch_message_decrypt(PurpleConnection * gc_p, xmlnode ** msg_stanza
     goto cleanup;
   }
   if (!key_p) {
-    purple_debug_info("lurch", "received omemo message that does not contain a key for this device, skipping\n");
+    debug_info("lurch", "received omemo message that does not contain a key for this device, skipping\n");
     goto cleanup;
   }
 
@@ -1954,8 +2105,8 @@ static void lurch_message_decrypt(PurpleConnection * gc_p, xmlnode ** msg_stanza
       if (ret_val) {
         if (ret_val == SG_ERR_DUPLICATE_MESSAGE && !g_strcmp0(sender, uname) && !g_strcmp0(recipient_bare_jid, uname)) {
           // in combination with message carbons, sending a message to your own account results in it arriving twice
-          purple_debug_warning("lurch", "ignoring decryption error due to a duplicate message from own account to own account\n");
-          *msg_stanza_pp = (void *) 0;
+          debug_warning("lurch", "ignoring decryption error due to a duplicate message from own account to own account\n");
+          //*msg_stanza_pp = (void *) 0; // XXX
           goto cleanup;
         } else {
           err_msg_dbg = g_strdup_printf("failed to decrypt key");
@@ -1963,7 +2114,7 @@ static void lurch_message_decrypt(PurpleConnection * gc_p, xmlnode ** msg_stanza
         }
       }
     } else {
-      purple_debug_info("lurch", "received omemo message but no session with the device exists, ignoring\n");
+      debug_info("lurch", "received omemo message but no session with the device exists, ignoring\n");
       goto cleanup;
     }
   } else if (ret_val == AXC_ERR_INVALID_KEY_ID) {
@@ -1973,20 +2124,21 @@ static void lurch_message_decrypt(PurpleConnection * gc_p, xmlnode ** msg_stanza
       goto cleanup;
     }
 
-    jabber_pep_request_item(purple_connection_get_protocol_data(gc_p),
-                            sender_addr.name, bundle_node_name,
-                            (void *) 0,
-                            lurch_pep_bundle_for_keytransport);
+    signal_emit("lurch peprequest bundle", 4, server, sender_addr.name, bundle_node_name, lurch_pep_bundle_for_keytransport);
+    // jabber_pep_request_item(purple_connection_get_protocol_data(gc_p),
+    //                         sender_addr.name, bundle_node_name,
+    //                         (void *) 0,
+    //                         lurch_pep_bundle_for_keytransport);
 
   } else if (ret_val) {
     err_msg_dbg = g_strdup_printf("failed to prekey msg");
     goto cleanup;
   } else {
-    lurch_bundle_publish_own(purple_connection_get_protocol_data(gc_p));
+    lurch_bundle_publish_own(server);
   }
 
   if (!omemo_message_has_payload(msg_p)) {
-    purple_debug_info("lurch", "received keytransportmsg\n");
+    debug_info("lurch", "received keytransportmsg\n");
     goto cleanup;
   }
 
@@ -1996,28 +2148,42 @@ static void lurch_message_decrypt(PurpleConnection * gc_p, xmlnode ** msg_stanza
     goto cleanup;
   }
 
-  plaintext_msg_node_p = xmlnode_from_str(xml, -1);
+  plaintext_msg_node_p = mxmlLoadString((void *) 0, xml, MXML_OPAQUE_CALLBACK);
 
   // libpurple doesn't know what to do with incoming messages addressed to someone else, so they need to be written to the conversation manually
   // incoming messages from the own account in MUCs are fine though
-  if (!g_strcmp0(sender, uname) && !g_strcmp0(type, "chat")) {
-    conv_p = purple_find_conversation_with_account(PURPLE_CONV_TYPE_IM, recipient_bare_jid, purple_connection_get_account(gc_p));
-    if (!conv_p) {
-      conv_p = purple_conversation_new(PURPLE_CONV_TYPE_IM, purple_connection_get_account(gc_p), recipient_bare_jid);
-    }
-    purple_conversation_write(conv_p, uname, xmlnode_get_data(xmlnode_get_child(plaintext_msg_node_p, "body")), PURPLE_MESSAGE_SEND, time((void *) 0));
-    *msg_stanza_pp = (void *) 0;
-  } else {
-    *msg_stanza_pp = plaintext_msg_node_p;
+  /* if (!g_strcmp0(sender, uname) && !g_strcmp0(type, "chat")) { */
+  /*   conv_p = purple_find_conversation_with_account(5/\*PURPLE_CONV_TYPE_IM*\/, recipient_bare_jid, purple_connection_get_account(gc_p)); */
+  /*   if (!conv_p) { */
+  /*     conv_p = purple_conversation_new(5/\*PURPLE_CONV_TYPE_IM*\/, purple_connection_get_account(gc_p), recipient_bare_jid); */
+  /*   } */
+  /*   purple_conversation_write(conv_p, uname, xmlnode_get_data(xmlnode_get_child(plaintext_msg_node_p, "body")), 6/\*PURPLE_MESSAGE_SEND*\/, time((void *) 0)); */
+  /*   *msg_stanza_pp = (void *) 0; */
+  /* } else { */
+  /*   *msg_stanza_pp = plaintext_msg_node_p; */
+  /* } */
+
+  g_warning("the decoded xml was: ##%s##", xml);
+  body_node_p = mxmlFindPath(plaintext_msg_node_p, "body");
+  if (!body_node_p) {
+    goto cleanup;
   }
+
+  lm_body_node_p = lm_message_node_get_child(lmsg->node, "body");
+  if (!lm_body_node_p) {
+    lm_body_node_p = lm_message_node_add_child(lmsg->node, "body", NULL);
+  }
+  lm_message_node_set_value(lm_body_node_p, mxmlGetOpaque(body_node_p));
+
 
 cleanup:
   if (err_msg_dbg) {
-    purple_conv_present_error(sender, purple_connection_get_account(gc_p), LURCH_ERR_STRING_DECRYPT);
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
+    printtext(server, from, MSGLEVEL_CLIENTERROR, "[lurch] %s", err_msg_dbg /* LURCH_ERR_STRING_DECRYPT */);
+    debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     free(err_msg_dbg);
   }
 
+  g_free(xml);
   g_strfreev(split);
   free(sender);
   free(xml);
@@ -2034,10 +2200,11 @@ cleanup:
   omemo_message_destroy(msg_p);
 }
 
-static void lurch_message_warn(PurpleConnection * gc_p, xmlnode ** msg_stanza_pp) {
+static void lurch_message_warn(SERVER_REC * server, LmMessage * lmsg, int type, const char * id, const char * from, const char * to)
+{
   int ret_val = 0;
 
-  xmlnode * temp_node_p = (void *) 0;
+  /*xmlnode*/ void * temp_node_p = (void *) 0;
   char * uname = (void *) 0;
   char * db_fn_omemo = (void *) 0;
   axc_context * axc_ctx_p = (void *) 0;
@@ -2045,10 +2212,7 @@ static void lurch_message_warn(PurpleConnection * gc_p, xmlnode ** msg_stanza_pp
   char ** split = (void *) 0;
   char * room_name = (void *) 0;
 
-  const char * type = xmlnode_get_attrib(*msg_stanza_pp, "type");
-  const char * from = xmlnode_get_attrib(*msg_stanza_pp, "from");
-
-  uname = lurch_uname_strip(purple_account_get_username(purple_connection_get_account(gc_p)));
+  uname = lurch_get_account(server, NULL);
   db_fn_omemo = lurch_uname_get_db_fn(uname, LURCH_DB_NAME_OMEMO);
 
   ret_val = lurch_axc_get_init_ctx(uname, &axc_ctx_p);
@@ -2056,13 +2220,13 @@ static void lurch_message_warn(PurpleConnection * gc_p, xmlnode ** msg_stanza_pp
     goto cleanup;
   }
 
-  temp_node_p = xmlnode_get_child(*msg_stanza_pp, "body");
+  temp_node_p = lm_message_node_get_child(lmsg->node, "body");
   if (!temp_node_p) {
     goto cleanup;
   }
 
-  if (!g_strcmp0(type, "chat")) {
-    conv_name = jabber_get_bare_jid(from);
+  if (type == LM_MESSAGE_SUB_TYPE_CHAT) {
+    conv_name = lurch_get_bare_jid(from);
 
     ret_val = axc_session_exists_any(conv_name, axc_ctx_p);
     if (ret_val < 0) {
@@ -2072,12 +2236,13 @@ static void lurch_message_warn(PurpleConnection * gc_p, xmlnode ** msg_stanza_pp
     } else if (ret_val == 1) {
       ret_val = omemo_storage_chatlist_exists(conv_name, db_fn_omemo);
       if (ret_val == 0) {
-        purple_conv_present_error(conv_name, purple_connection_get_account(gc_p),
+        printtext(server, from, MSGLEVEL_CLIENTNOTICE, "[lurch] %s",
                                   "Even though you have an encryption session with this user, you received a plaintext message.");
       }
     } else {
+      debug_error("lurch", "%s: (%i)\n", __func__, ret_val);
     }
-  } else if (!g_strcmp0(type, "groupchat")) {
+  } else if (type == LM_MESSAGE_SUB_TYPE_GROUPCHAT) {
     split = g_strsplit(from, "/", 2);
     room_name = split[0];
 
@@ -2087,42 +2252,40 @@ static void lurch_message_warn(PurpleConnection * gc_p, xmlnode ** msg_stanza_pp
     } else if (ret_val == 0) {
       goto cleanup;
     } else if (ret_val == 1) {
-      purple_conv_present_error(room_name, purple_connection_get_account(gc_p),
+      printtext(server, room_name, MSGLEVEL_CLIENTNOTICE, "[lurch] %s",
                                 "This groupchat is set to encrypted, but you received a plaintext message.");
     }
   }
 
 cleanup:
-  free(uname);
+  g_free(uname);
   free(db_fn_omemo);
   free(conv_name);
   g_strfreev(split);
   axc_context_destroy_all(axc_ctx_p);
 }
 
-static void lurch_xml_received_cb(PurpleConnection * gc_p, xmlnode ** stanza_pp) {
-  char * node_name = (*stanza_pp)->name;
-  xmlnode * temp_node_p = (void *) 0;
+static void lurch_xml_received_cb(SERVER_REC * server, LmMessage * lmsg, int type, const char * id, const char * from, const char * to) {
+  LmMessageNode * temp_node_p = (void *) 0;
 
   if (uninstall) {
     return;
   }
 
-  if (!g_strcmp0(node_name, "message")) {
-    temp_node_p = xmlnode_get_child(*stanza_pp, "encrypted");
-    if (temp_node_p) {
-      lurch_message_decrypt(gc_p, stanza_pp);
-    } else {
-      lurch_message_warn(gc_p, stanza_pp);
-    }
+  temp_node_p = lm_message_node_get_child(lmsg->node, "encrypted");
+  if (temp_node_p) {
+    lurch_message_decrypt(server, lmsg, type, id, from, to);
+  } else {
+    lurch_message_warn(server, lmsg, type, id, from, to);
   }
 }
 
-static int lurch_topic_update_im(PurpleConversation * conv_p) {
+static char * lurch_expando_encryption_omemo(SERVER_REC * server, WI_ITEM_REC * item, gboolean * free_ret)
+{
   int ret_val = 0;
 
   char * uname = (void *) 0;
-  const char * partner_name = purple_conversation_get_name(conv_p);
+  char * partner_name = lurch_irssi_conversation_get_name(item);
   char * partner_name_bare = (void *) 0;
   axc_context * axc_ctx_p = (void *) 0;
   char * db_fn_omemo = (void *) 0;
@@ -2130,9 +2293,9 @@ static int lurch_topic_update_im(PurpleConversation * conv_p) {
 
   char * new_title = (void *) 0;
 
-  uname = lurch_uname_strip(purple_account_get_username(purple_conversation_get_account(conv_p)));
+  uname = lurch_get_account(server, item);
   db_fn_omemo = lurch_uname_get_db_fn(uname, LURCH_DB_NAME_OMEMO);
-  partner_name_bare = jabber_get_bare_jid(partner_name);
+  partner_name_bare = lurch_get_bare_jid(partner_name);
 
   if (uninstall) {
     goto cleanup;
@@ -2152,7 +2315,7 @@ static int lurch_topic_update_im(PurpleConversation * conv_p) {
   if (ret_val < 0) {
     goto cleanup;
   } else if (ret_val) {
-    new_title = g_strdup_printf("%s (%s)", partner_name, "OMEMO");
+    new_title = g_strdup("OMEMO");
 
   } else {
     ret_val = omemo_storage_user_devicelist_retrieve(partner_name_bare, db_fn_omemo, &dl_p);
@@ -2161,12 +2324,8 @@ static int lurch_topic_update_im(PurpleConversation * conv_p) {
     }
 
     if (!omemo_devicelist_is_empty(dl_p)) {
-      new_title = g_strdup_printf("%s (%s)", partner_name, "OMEMO available");
+      new_title = g_strdup_printf("OMEMO available");
     }
-  }
-
-  if (new_title) {
-    purple_conversation_set_title(conv_p, new_title);
   }
 
 cleanup:
@@ -2175,74 +2334,43 @@ cleanup:
   axc_context_destroy_all(axc_ctx_p);
   free(db_fn_omemo);
   omemo_devicelist_destroy(dl_p);
+  g_free(partner_name);
   free(partner_name_bare);
 
-  return ret_val;
+  if (new_title) {
+    *free_ret = TRUE;
+  }
+
+  return new_title;
 }
 
-static int lurch_topic_update_chat(PurpleConversation * conv_p) {
-  int ret_val = 0;
-
-  char * uname = (void *) 0;
-  char * db_fn_omemo = (void *) 0;
-  char * new_title = (void *) 0;
-
-  uname = lurch_uname_strip(purple_account_get_username(purple_conversation_get_account(conv_p)));
-  db_fn_omemo = lurch_uname_get_db_fn(uname, LURCH_DB_NAME_OMEMO);
-
-  if (uninstall) {
-    goto cleanup;
-  }
-
-  ret_val = omemo_storage_chatlist_exists(purple_conversation_get_name(conv_p), db_fn_omemo);
-  if (ret_val < 1) {
-    goto cleanup;
-  }
-
-  new_title = g_strdup_printf("%s (%s)", purple_conversation_get_title(conv_p), "OMEMO");
-  purple_conversation_set_title(conv_p, new_title);
-
-cleanup:
-  free(uname);
-  free(db_fn_omemo);
-  free(new_title);
-
-  return ret_val;
-}
-
-static void lurch_conv_created_cb(PurpleConversation * conv_p) {
-  if (strncmp(purple_account_get_protocol_id(purple_conversation_get_account(conv_p)), JABBER_PROTOCOL_ID, strlen(JABBER_PROTOCOL_ID))) {
-    return;
-  }
-
-  if (purple_conversation_get_type(conv_p) == PURPLE_CONV_TYPE_IM) {
-    lurch_topic_update_im(conv_p);
-  } else if (purple_conversation_get_type(conv_p) == PURPLE_CONV_TYPE_CHAT) {
-    lurch_topic_update_chat(conv_p);
+static void lurch_conv_created_cb(WI_ITEM_REC * item, gboolean automatic) {
+  gboolean free_ret = FALSE;
+  char * title = lurch_expando_encryption_omemo(item->server, item, &free_ret);
+  char * name = lurch_irssi_conversation_get_name(item);
+  printtext(item->server, item->name, MSGLEVEL_CLIENTNOTICE, "[lurch] %s (omemo status: %s)", name, title);
+  g_free(name);
+  if (free_ret) {
+    g_free(title);
   }
 }
 
-static void lurch_conv_updated_cb(PurpleConversation * conv_p, PurpleConvUpdateType type) {
-  if (strncmp(purple_account_get_protocol_id(purple_conversation_get_account(conv_p)), JABBER_PROTOCOL_ID, strlen(JABBER_PROTOCOL_ID))) {
-    return;
-  }
+static char * lurch_fp_printable_x(const guchar * data, gsize len)
+{
+  int i;
+  gchar * out = (void *) 0;
 
-  if (type == PURPLE_CONV_UPDATE_TITLE) {
-    if (!topic_changed) {
-      topic_changed = 1;
-      if (purple_conversation_get_type(conv_p) == PURPLE_CONV_TYPE_IM) {
-        lurch_topic_update_im(conv_p);
-      } else if (purple_conversation_get_type(conv_p) == PURPLE_CONV_TYPE_CHAT) {
-        lurch_topic_update_chat(conv_p);
-      }
-
-      topic_changed = 0;
-    } else {
-      topic_changed = 0;
+  out = g_malloc(len * 2 + len / 4 + 1);
+  for (i = 0; i < len; ++i) {
+    g_snprintf(&out[i * 2 + i / 4], 3, "%02hhx", data[i]);
+    if (i % 4 == 3) {
+      g_snprintf(&out[i * 2 + i / 4 + 2], 2, " ");
     }
   }
+  return out;
 }
 
+static char * lurch_fp_printable(const char * fp) __attribute__((unused));
 /**
  * Creates a fingerprint which resembles the one displayed by Conversations etc.
  * Also useful for avoiding the smileys produced by ':d'...
@@ -2273,11 +2401,8 @@ static char * lurch_fp_printable(const char * fp) {
   return temp2;
 }
 
-static PurpleCmdRet lurch_cmd_func(PurpleConversation * conv_p,
-                                   const gchar * cmd,
-                                   gchar ** args,
-                                   gchar ** error,
-                                   void * data_p) {
+static void lurch_cmd_func(const char * data, SERVER_REC * server, WI_ITEM_REC * item)
+{
   int ret_val = 0;
   char * err_msg = (void *) 0;
 
@@ -2297,24 +2422,40 @@ static PurpleCmdRet lurch_cmd_func(PurpleConversation * conv_p,
   char * temp_msg_1 = (void *) 0;
   char * temp_msg_2 = (void *) 0;
   char * temp_msg_3 = (void *) 0;
-  xmlnode * dl_node_p = (void *) 0;
   char * bare_jid = (void *) 0;
+  char * conversation_jid = (void *) 0;
 
   char * msg = (void *) 0;
 
-  uname = lurch_uname_strip(purple_account_get_username(purple_conversation_get_account(conv_p)));
-  db_fn_omemo = lurch_uname_get_db_fn(uname, LURCH_DB_NAME_OMEMO);
-
-  ret_val = lurch_axc_get_init_ctx(uname, &axc_ctx_p);
-  if (ret_val) {
-    err_msg = g_strdup("Failed to create axc ctx.");
+  GError * error = (void *) 0;
+  int argc = 0;
+  char ** args = {0};
+  if (!g_shell_parse_argv(data, &argc, &args, &error)) {
+    err_msg = g_strdup(error->message);
+    g_error_free(error);
     goto cleanup;
   }
 
-  ret_val = axc_get_device_id(axc_ctx_p, &id);
-  if (ret_val) {
-    err_msg = g_strdup_printf("Failed to access axc db %s. Does the path seem correct?", axc_context_get_db_fn(axc_ctx_p));
+  if (server == NULL && item == NULL && !!g_strcmp0(args[0], "help")) {
+    err_msg = g_strdup("Not connected.");
     goto cleanup;
+  }
+
+  if (server != NULL || item != NULL) {
+    uname = lurch_get_account(server, item);
+    db_fn_omemo = lurch_uname_get_db_fn(uname, LURCH_DB_NAME_OMEMO);
+
+    ret_val = lurch_axc_get_init_ctx(uname, &axc_ctx_p);
+    if (ret_val) {
+      err_msg = g_strdup("Failed to create axc ctx.");
+      goto cleanup;
+    }
+
+    ret_val = axc_get_device_id(axc_ctx_p, &id);
+    if (ret_val) {
+      err_msg = g_strdup_printf("Failed to access axc db %s. Does the path seem correct?", axc_context_get_db_fn(axc_ctx_p));
+      goto cleanup;
+    }
   }
 
   if (!g_strcmp0(args[0], "uninstall")) {
@@ -2350,12 +2491,13 @@ static PurpleCmdRet lurch_cmd_func(PurpleConversation * conv_p,
       }
 
       uninstall = 1;
-      purple_account_set_bool(purple_conversation_get_account(conv_p), LURCH_ACC_SETTING_INITIALIZED, FALSE);
-      dl_node_p = xmlnode_from_str(temp_msg_1, -1);
-      jabber_pep_publish(purple_connection_get_protocol_data(purple_conversation_get_gc(conv_p)), dl_node_p);
+      signal_emit("lurch send devicelist", 3, server, uname, temp_msg_1);
+
+      //dl_node_p = xmlnode_from_str(temp_msg_1, -1);
+      //jabber_pep_publish(purple_connection_get_protocol_data(purple_conversation_get_gc(conv_p)), dl_node_p);
       msg = g_strdup_printf("Published devicelist minus this device's ID. "
                             "You can deactivate the plugin now, otherwise it will be republished at the next startup. "
-                            "To delete all existing data you also have to delete the DB files in your ~/.pidgin folder.");
+                            "To delete all existing data you also have to delete the DB files in your ~/.irssi folder.");
     } else {
       msg = g_strdup("To uninstall lurch for this device, type 'lurch uninstall yes'.");
     }
@@ -2378,21 +2520,23 @@ static PurpleCmdRet lurch_cmd_func(PurpleConversation * conv_p,
                    " - '/lurch help': Displays this message.\n"
                    " - '/lurch uninstall': Uninstalls this device from OMEMO by removing its device ID from the devicelist.");
   } else {
-    if(purple_conversation_get_type(conv_p) == 1) {
+    if(IS_QUERY(item)) {
       if (!g_strcmp0(args[0], "blacklist")) {
         if (!g_strcmp0(args[1], "add")) {
-          temp_msg_1 = jabber_get_bare_jid(purple_conversation_get_name(conv_p));
+	  conversation_jid = lurch_irssi_conversation_get_name(item);
+          temp_msg_1 = lurch_get_bare_jid(conversation_jid);
           ret_val = omemo_storage_chatlist_save(temp_msg_1, db_fn_omemo);
           if (ret_val) {
             err_msg = g_strdup_printf("Failed to look up %s in DB %s.", temp_msg_1, db_fn_omemo);
             goto cleanup;
           }
 
-          purple_conversation_autoset_title(conv_p);
+	  signal_emit("lurch encryption changed", 2, item, GINT_TO_POINTER(0));
 
           msg = g_strdup_printf("Added %s to your blacklist. Even if OMEMO is available, it will not be used.", temp_msg_1);
         } else if (!g_strcmp0(args[1], "remove")) {
-          temp_msg_1 = jabber_get_bare_jid(purple_conversation_get_name(conv_p));
+	  conversation_jid = lurch_irssi_conversation_get_name(item);
+          temp_msg_1 = lurch_get_bare_jid(conversation_jid);
           ret_val = omemo_storage_chatlist_delete(temp_msg_1, db_fn_omemo);
           if (ret_val) {
             err_msg = g_strdup_printf("Failed to delete %s in DB %s.", temp_msg_1, db_fn_omemo);
@@ -2401,8 +2545,7 @@ static PurpleCmdRet lurch_cmd_func(PurpleConversation * conv_p,
 
           msg = g_strdup_printf("Removed %s from your blacklist. If OMEMO is available, it will be used.", temp_msg_1);
 
-          topic_changed = 1;
-          lurch_topic_update_im(conv_p);
+	  signal_emit("lurch encryption changed", 2, item, GINT_TO_POINTER(-1));
         } else {
           msg = g_strdup("Valid arguments for 'lurch blacklist' are 'add' and 'remove'.");
         }
@@ -2447,8 +2590,7 @@ static PurpleCmdRet lurch_cmd_func(PurpleConversation * conv_p,
               goto cleanup;
             }
 
-            fp = purple_base16_encode_chunked(axc_buf_get_data(key_buf_p), axc_buf_get_len(key_buf_p));
-            fp_printable = lurch_fp_printable(fp);
+            fp_printable = lurch_fp_printable_x(axc_buf_get_data(key_buf_p), axc_buf_get_len(key_buf_p));
             msg = g_strdup_printf("This device's fingerprint is:\n%s\n"
                                   "You should make sure that your conversation partner gets displayed the same for this device.", fp_printable);
           } else if (!g_strcmp0(args[2], "conv")) {
@@ -2459,8 +2601,7 @@ static PurpleCmdRet lurch_cmd_func(PurpleConversation * conv_p,
               goto cleanup;
             }
 
-            fp = purple_base16_encode_chunked(axc_buf_get_data(key_buf_p), axc_buf_get_len(key_buf_p));
-            fp_printable = lurch_fp_printable(fp);
+            fp_printable = lurch_fp_printable_x(axc_buf_get_data(key_buf_p), axc_buf_get_len(key_buf_p));
 
             temp_msg_1 = g_strdup_printf("The devices participating in this conversation and their fingerprints are as follows:\n"
                                          "This device's (%s:%i) fingerprint:\n%s\n", uname, id, fp_printable);
@@ -2483,8 +2624,7 @@ static PurpleCmdRet lurch_cmd_func(PurpleConversation * conv_p,
                 }
 
                 g_free(fp);
-                fp = purple_base16_encode_chunked(axc_buf_get_data(key_buf_p), axc_buf_get_len(key_buf_p));
-                fp_printable = lurch_fp_printable(fp);
+                fp_printable = lurch_fp_printable_x(axc_buf_get_data(key_buf_p), axc_buf_get_len(key_buf_p));
                 axc_buf_free(key_buf_p);
                 key_buf_p = (void *) 0;
 
@@ -2498,7 +2638,8 @@ static PurpleCmdRet lurch_cmd_func(PurpleConversation * conv_p,
               }
             }
 
-            bare_jid = jabber_get_bare_jid(purple_conversation_get_name(conv_p));
+	    conversation_jid = lurch_irssi_conversation_get_name(item);
+            bare_jid = lurch_get_bare_jid(conversation_jid);
 
             ret_val = omemo_storage_user_devicelist_retrieve(bare_jid, db_fn_omemo, &other_dl_p);
             if (ret_val) {
@@ -2517,8 +2658,7 @@ static PurpleCmdRet lurch_cmd_func(PurpleConversation * conv_p,
               }
 
               g_free(fp);
-              fp = purple_base16_encode_chunked(axc_buf_get_data(key_buf_p), axc_buf_get_len(key_buf_p));
-              fp_printable = lurch_fp_printable(fp);
+              fp_printable = lurch_fp_printable_x(axc_buf_get_data(key_buf_p), axc_buf_get_len(key_buf_p));
               axc_buf_free(key_buf_p);
               key_buf_p = (void *) 0;
 
@@ -2568,8 +2708,9 @@ static PurpleCmdRet lurch_cmd_func(PurpleConversation * conv_p,
                 goto cleanup;
               }
 
-              dl_node_p = xmlnode_from_str(temp_msg_1, -1);
-              jabber_pep_publish(purple_connection_get_protocol_data(purple_conversation_get_gc(conv_p)), dl_node_p);
+	      signal_emit("lurch send devicelist", 3, server, uname, temp_msg_1);
+              //dl_node_p = xmlnode_from_str(temp_msg_1, -1);
+              //jabber_pep_publish(purple_connection_get_protocol_data(purple_conversation_get_gc(conv_p)), dl_node_p);
 
               msg = g_strdup_printf("Removed %i from devicelist and republished it.", remove_id);
             }
@@ -2581,29 +2722,30 @@ static PurpleCmdRet lurch_cmd_func(PurpleConversation * conv_p,
       } else {
         msg = g_strdup("Valid arguments for 'lurch' in IMs are 'show', 'remove', 'blacklist', 'uninstall', and 'help'.");
       }
-    } else if (purple_conversation_get_type(conv_p) == 2) {
+    } else if (IS_CHANNEL(item)) {
       if (!g_strcmp0(args[0], "enable")) {
-        ret_val = omemo_storage_chatlist_save(purple_conversation_get_name(conv_p), db_fn_omemo);
+	conversation_jid = lurch_irssi_conversation_get_name(item);
+        ret_val = omemo_storage_chatlist_save(conversation_jid, db_fn_omemo);
         if (ret_val) {
-          err_msg = g_strdup_printf("Failed to look up %s in DB %s.", purple_conversation_get_name(conv_p), db_fn_omemo);
+          err_msg = g_strdup_printf("Failed to look up %s in DB %s.", conversation_jid, db_fn_omemo);
           goto cleanup;
         }
 
-        topic_changed = 1;
-        lurch_topic_update_chat(conv_p);
+	signal_emit("lurch encryption changed", 2, item, GINT_TO_POINTER(1));
 
         msg = g_strdup_printf("Activated OMEMO for this chat. This is a client-side setting, so every participant needs to activate it to work.");
       } else if (!g_strcmp0(args[0], "disable")) {
-        ret_val = omemo_storage_chatlist_delete(purple_conversation_get_name(conv_p), db_fn_omemo);
+	conversation_jid = lurch_irssi_conversation_get_name(item);
+        ret_val = omemo_storage_chatlist_delete(conversation_jid, db_fn_omemo);
         if (ret_val) {
-          err_msg = g_strdup_printf("Failed to delete %s in DB %s.\n", purple_conversation_get_name(conv_p), db_fn_omemo);
+          err_msg = g_strdup_printf("Failed to delete %s in DB %s.\n", conversation_jid, db_fn_omemo);
           goto cleanup;
         }
 
         msg = g_strdup_printf("Deactivated OMEMO for this chat. "
                               "This is a client-side setting and if other users still have it activated, you will not be able to read their messages.");
 
-        purple_conversation_autoset_title(conv_p);
+	signal_emit("lurch encryption changed", 2, item, GINT_TO_POINTER(0));
       } else {
         msg = g_strdup("Valid arguments for 'lurch' in groupchats are 'enable', 'disable', 'uninstall', and 'help'.");
       }
@@ -2611,7 +2753,7 @@ static PurpleCmdRet lurch_cmd_func(PurpleConversation * conv_p,
   }
 
   if (msg) {
-    purple_conversation_write(conv_p, "lurch", msg, PURPLE_MESSAGE_SYSTEM | PURPLE_MESSAGE_NO_LOG, time((void *) 0));
+    printtext(server, item ? item->name : NULL, MSGLEVEL_CLIENTNOTICE | MSGLEVEL_NEVER, "[lurch] %s", msg);
   }
 
 cleanup:
@@ -2629,30 +2771,66 @@ cleanup:
   g_free(temp_msg_1);
   g_free(temp_msg_2);
   g_free(temp_msg_3);
+  g_free(conversation_jid);
   g_free(bare_jid);
+  g_strfreev(args);
 
 
   if (ret_val < 0) {
-    *error = err_msg;
-    return PURPLE_CMD_RET_FAILED;
+    //*error = err_msg;
+    printtext(server, NULL, MSGLEVEL_CLIENTERROR, "[lurch] %s", err_msg);
+    return; /* PURPLE_CMD_RET_FAILED */
   } else {
-    return PURPLE_CMD_RET_OK;
+    return; /* PURPLE_CMD_RET_OK */
   }
 }
+
+static void irssi_lurch_peprequest(SERVER_REC * server, const char * to, const char * node, void * callback_fn)
+{
+  LmMessage * jiq_p = lm_message_new_with_sub_type(to, LM_MESSAGE_TYPE_IQ, LM_MESSAGE_SUB_TYPE_GET);
+  LmMessageNode * pubsub_node_p = lm_message_node_add_child(jiq_p->node, "pubsub", NULL);
+  lm_message_node_set_attribute(pubsub_node_p, "xmlns", "http://jabber.org/protocol/pubsub");
+
+  char * req_id;
+  while (1) {
+    char * rand_str = g_strdup_printf("%i", g_random_int());
+    req_id = g_strconcat(to, "#", rand_str, NULL);
+    if (g_hash_table_lookup(lurch_peprequest_response_ht, req_id) != NULL) {
+      g_free(rand_str);
+      g_free(req_id);
+      continue;
+    }
+    break;
+  }
+
+  LmMessageNode * items_node_p = lm_message_node_add_child(pubsub_node_p, "items", NULL);
+  lm_message_node_set_attribute(items_node_p, "node", node);
+  lm_message_node_set_attribute(items_node_p, "max_items", "1");
+
+  lm_message_node_set_attribute(jiq_p->node, "id", req_id);
+
+  g_hash_table_insert(lurch_peprequest_response_ht, req_id, callback_fn);
+  
+  signal_emit("xmpp send iq", 2, server, jiq_p);
+  
+}
+
 
 /**
  * Actions to perform on plugin load.
  * Inits the crypto and registers signal and PEP handlers.
  */
-static gboolean lurch_plugin_load(PurplePlugin * plugin_p) {
+void lurch_core_init(void)
+{
+  GSList * tmp;
   int ret_val = 0;
   char * err_msg_dbg = (void *) 0;
 
   char * dl_ns = (void *) 0;
-  void * jabber_handle_p = (void *) 0;
   GList * accs_l_p = (void *) 0;
-  GList * curr_p = (void *) 0;
-  PurpleAccount * acc_p = (void *) 0;
+
+  lurch_bundle_request_ht = g_hash_table_new(NULL, g_str_equal);
+  lurch_peprequest_response_ht = g_hash_table_new(NULL, g_str_equal);
 
   omemo_default_crypto_init();
 
@@ -2662,64 +2840,84 @@ static gboolean lurch_plugin_load(PurplePlugin * plugin_p) {
     goto cleanup;
   }
 
-  lurch_cmd_id = purple_cmd_register("lurch",
-                                     "wwws",
-                                     PURPLE_CMD_P_PLUGIN,
-                                     PURPLE_CMD_FLAG_IM | PURPLE_CMD_FLAG_CHAT | PURPLE_CMD_FLAG_PRPL_ONLY | PURPLE_CMD_FLAG_ALLOW_WRONG_ARGS,
-                                     JABBER_PROTOCOL_ID,
-                                     lurch_cmd_func,
-                                     "lurch &lt;help&gt;:  "
-                                     "Interface to the lurch plugin. For details, use the 'help' argument.",
-                                     (void *) 0);
+  settings_add_bool("misc", LURCH_PREF_AXC_LOGGING, TRUE);
+  settings_add_choice("misc", LURCH_PREF_AXC_LOGGING_LEVEL, 4, "error;warning;notice;info;debug");
 
-  // register handlers
-  jabber_handle_p = purple_plugins_find_with_id(JABBER_PROTOCOL_ID);
+  command_bind("lurch", NULL, (SIGNAL_FUNC) lurch_cmd_func);
+  signal_add("xmpp recv message", (SIGNAL_FUNC) lurch_xml_received_cb);
+  signal_add("xmpp send message", (SIGNAL_FUNC) lurch_xml_sent_cb);
 
-  (void) purple_signal_connect_priority(jabber_handle_p, "jabber-receiving-xmlnode", plugin_p, PURPLE_CALLBACK(lurch_xml_received_cb), NULL, PURPLE_PRIORITY_HIGHEST - 100);
-  (void) purple_signal_connect_priority(jabber_handle_p, "jabber-sending-xmlnode", plugin_p, PURPLE_CALLBACK(lurch_xml_sent_cb), NULL, PURPLE_PRIORITY_HIGHEST - 100);
+  signal_add("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_bundle_request_cb);
+  signal_add("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_peprequest_cb);
+  signal_add("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_iq_cb);
 
-  jabber_pep_register_handler(dl_ns, lurch_pep_devicelist_event_handler);
-  jabber_add_feature(dl_ns, jabber_pep_namespace_only_when_pep_enabled_cb);
+  // too early :(
+  //signal_add("chat protocol created", (SIGNAL_FUNC) irssi_lurch_register_features_cb);
+
+  signal_emit("xmpp register feature", 1, dl_ns);
+  char * dl_ns_notify = g_strconcat(dl_ns , "+notify", NULL);
+  signal_emit("xmpp register feature", 1, dl_ns_notify);
+  g_free(dl_ns_notify);
+
+  // jabber_pep_register_handler(dl_ns, lurch_pep_devicelist_event_handler);
+  g_dl_ns = g_strdup(dl_ns);
+  // jabber_add_feature(dl_ns, jabber_pep_namespace_only_when_pep_enabled_cb);
 
   // manually call init code if there are already accounts connected, e.g. when plugin is loaded manually
-  accs_l_p = purple_accounts_get_all_active();
-  for (curr_p = accs_l_p; curr_p; curr_p = curr_p->next) {
-    acc_p = (PurpleAccount *) curr_p->data;
-    if (purple_account_is_connected(acc_p)) {
-      if (!g_strcmp0(purple_account_get_protocol_id(acc_p), JABBER_PROTOCOL_ID)) {
-        lurch_account_connect_cb(acc_p);
-      }
+  for (tmp = servers; tmp != NULL; tmp = tmp->next) {
+    SERVER_REC * server = tmp->data;
+    if (server->connected) {
+      lurch_account_connect_cb(server);
     }
   }
 
   // register install callback
-  (void) purple_signal_connect(purple_accounts_get_handle(), "account-signed-on", plugin_p, PURPLE_CALLBACK(lurch_account_connect_cb), NULL);
-  (void) purple_signal_connect(purple_conversations_get_handle(), "conversation-created", plugin_p, PURPLE_CALLBACK(lurch_conv_created_cb), NULL);
-  (void) purple_signal_connect(purple_conversations_get_handle(), "conversation-updated", plugin_p, PURPLE_CALLBACK(lurch_conv_updated_cb), NULL);
+  signal_add("server connected", (SIGNAL_FUNC) lurch_account_connect_cb);
+  signal_add("query created", (SIGNAL_FUNC) lurch_conv_created_cb);
+  signal_add("channel created", (SIGNAL_FUNC) lurch_conv_created_cb);
+  // (void) purple_signal_connect(purple_conversations_get_handle(), "conversation-updated", plugin_p, PURPLE_CALLBACK(lurch_conv_updated_cb), NULL);
+
+  expando_create("encryption_omemo", (EXPANDO_FUNC) lurch_expando_encryption_omemo,
+		 "window changed", EXPANDO_ARG_NONE,
+		 "window item changed", EXPANDO_ARG_WINDOW,
+		 "lurch encryption changed", EXPANDO_ARG_WINDOW_ITEM,
+		 NULL);
+
+  signal_add("lurch peprequest bundle", (SIGNAL_FUNC) irssi_lurch_peprequest);
+  signal_add("lurch peprequest own_devicelist", (SIGNAL_FUNC) irssi_lurch_peprequest);
 
 cleanup:
   free(dl_ns);
   g_list_free(accs_l_p);
   if (ret_val) {
-    purple_debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
-    omemo_default_crypto_teardown();
-    return FALSE;
+    g_warning("[lurch]" "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
   }
 
-  return TRUE;
+  module_register("lurch", "core");
 }
 
-static gboolean lurch_plugin_unload(PurplePlugin * plugin_p) {
+void lurch_core_deinit(void)
+{
+  expando_destroy("encryption_omemo", (EXPANDO_FUNC) lurch_expando_encryption_omemo);
+
+  signal_remove("server connected", (SIGNAL_FUNC) lurch_account_connect_cb);
+  signal_remove("query created", (SIGNAL_FUNC) lurch_conv_created_cb);
+  signal_remove("channel created", (SIGNAL_FUNC) lurch_conv_created_cb);
+
+  signal_remove("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_bundle_request_cb);
+  signal_remove("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_peprequest_cb);
+  signal_remove("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_iq_cb);
+
   omemo_default_crypto_teardown();
 
-  return TRUE;
+  g_hash_table_unref(lurch_bundle_request_ht);
+  g_hash_table_unref(lurch_peprequest_response_ht);
+  g_free(g_dl_ns);
 }
 
-static PurplePluginPrefFrame * lurch_get_plugin_pref_frame(PurplePlugin * plugin_p) {
-  PurplePluginPrefFrame * frame_p;
-  PurplePluginPref * ppref_p;
-
-  frame_p = purple_plugin_pref_frame_new();
+#if 0
+void prefs(void)
+{
   ppref_p = purple_plugin_pref_new_with_label("Extended logging");
   purple_plugin_pref_frame_add(frame_p, ppref_p);
 
@@ -2728,74 +2926,27 @@ static PurplePluginPrefFrame * lurch_get_plugin_pref_frame(PurplePlugin * plugin
                   "Show log output from underlying libraries");
   purple_plugin_pref_frame_add(frame_p, ppref_p);
 
-  ppref_p = purple_plugin_pref_new_with_name_and_label(
-                    LURCH_PREF_AXC_LOGGING_LEVEL,
-                    "Log level");
-  purple_plugin_pref_set_type(ppref_p, PURPLE_PLUGIN_PREF_CHOICE);
-  purple_plugin_pref_add_choice(ppref_p, "ERROR", GINT_TO_POINTER(AXC_LOG_ERROR));
-  purple_plugin_pref_add_choice(ppref_p, "WARNING", GINT_TO_POINTER(AXC_LOG_WARNING));
-  purple_plugin_pref_add_choice(ppref_p, "NOTICE", GINT_TO_POINTER(AXC_LOG_NOTICE));
-  purple_plugin_pref_add_choice(ppref_p, "INFO", GINT_TO_POINTER(AXC_LOG_INFO));
-  purple_plugin_pref_add_choice(ppref_p, "DEBUG", GINT_TO_POINTER(AXC_LOG_DEBUG));
-  purple_plugin_pref_frame_add(frame_p, ppref_p);
-
-  return frame_p;
 }
+#endif
 
-static PurplePluginUiInfo prefs_info = {
-  lurch_get_plugin_pref_frame,
-  0,    /* page_num (Reserved) */
-  NULL, /* frame (Reserved) */
+#if 0
+x = {
+     "core-riba-lurch",
+     "lurch",
+     LURCH_VERSION,
 
-  /* padding */
-  NULL,
-  NULL,
-  NULL,
-  NULL
+     "Implements OMEMO for libpurple.",
+     "End-to-end encryption using the Signal protocol, adapted for XMPP.",
+     LURCH_AUTHOR,
+     "https://github.com/gkdr/lurch",
 };
+#endif
 
-static PurplePluginInfo info = {
-    PURPLE_PLUGIN_MAGIC,
-    PURPLE_MAJOR_VERSION,
-    PURPLE_MINOR_VERSION,
-    PURPLE_PLUGIN_STANDARD,
-    NULL,
-    0,
-    NULL,
-    PURPLE_PRIORITY_DEFAULT,
 
-    "core-riba-lurch",
-    "lurch",
-    LURCH_VERSION,
-
-    "Implements OMEMO for libpurple.",
-    "End-to-end encryption using the Signal protocol, adapted for XMPP.",
-    LURCH_AUTHOR,
-    "https://github.com/gkdr/lurch",
-
-    lurch_plugin_load,
-    lurch_plugin_unload,
-    NULL,
-
-    NULL,
-    NULL,
-    &prefs_info, // plugin config, see libpurple/plugins/pluginpref_example.c
-    NULL,        // plugin actions, see https://developer.pidgin.im/wiki/CHowTo/PluginActionsHowTo
-    NULL,
-    NULL,
-    NULL,
-    NULL
-};
-
-static void
-lurch_plugin_init(PurplePlugin * plugin_p) {
-  PurplePluginInfo * info_p = plugin_p->info;
-
-  info_p->dependencies = g_list_prepend(info_p->dependencies, "prpl-jabber");
-
-  purple_prefs_add_none(LURCH_PREF_ROOT);
-  purple_prefs_add_bool(LURCH_PREF_AXC_LOGGING, FALSE);
-  purple_prefs_add_int(LURCH_PREF_AXC_LOGGING_LEVEL, AXC_LOG_INFO);
+#ifdef IRSSI_ABI_VERSION
+void
+lurch_core_abicheck(int * version)
+{
+        *version = IRSSI_ABI_VERSION;
 }
-
-PURPLE_INIT_PLUGIN(lurch, lurch_plugin_init, info)
+#endif

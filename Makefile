@@ -24,19 +24,26 @@ GLIB_LDFLAGS ?= $(shell $(PKG_CONFIG) --libs glib-2.0)
 LIBPURPLE_CFLAGS=$(shell $(PKG_CONFIG) --cflags purple)
 LIBPURPLE_LDFLAGS=$(shell $(PKG_CONFIG) --cflags purple) \
 		    -L$(shell $(PKG_CONFIG) --variable=plugindir purple)
-		    
+
+IRSSI ?= /home/ailin/IRSSI_STUFF/irssi_inst/include
+
+LOUDMOUTH_CFLAGS=$(shell $(PKG_CONFIG) --cflags loudmouth-1.0)
+
+IRSSI_CFLAGS ?= -I$(IRSSI) -I$(IRSSI)/irssi -I$(IRSSI)/irssi/src -I$(IRSSI)/irssi/src/core
+
 XML2_CFLAGS ?= $(shell $(XML2_CONFIG) --cflags)
 XML2_LDFLAGS ?= $(shell $(XML2_CONFIG) --libs)
 
 LIBGCRYPT_LDFLAGS ?= $(shell $(LIBGCRYPT_CONFIG) --libs)
 
 PKGCFG_C=$(GLIB_CFLAGS) \
-	 $(LIBPURPLE_CFLAGS) \
+	 $(IRSSI_CFLAGS) \
+	 $(LOUDMOUTH_CFLAGS) \
 	 $(XML2_CFLAGS)
 
 
 PKGCFG_L=$(shell $(PKG_CONFIG) --libs sqlite3 mxml) \
- 	$(GLIB_LDFLAGS) \
+	 $(GLIB_LDFLAGS) \
 	 $(LIBPURPLE_LDFLAGS) \
 	 $(XML2_LDFLAGS) \
 	 $(LIBGCRYPT_LDFLAGS)
@@ -47,14 +54,15 @@ else
 ifneq ("$(wildcard /etc/SuSE-release)","")
 	LJABBER= -lxmpp
 else
-	LJABBER= -ljabber
+#	LJABBER= -ljabber
+	LJABBER= 
 endif
 endif
 
 HEADERS=-I$(HDIR)/jabber -I$(LOMEMO_SRC) -I$(AXC_SRC) -I$(AX_DIR)/src
 CFLAGS += -std=c11 -Wall -g -Wstrict-overflow $(PKGCFG_C) $(HEADERS)
 PLUGIN_CPPFLAGS=-DPURPLE_PLUGINS
-CPPFLAGS += -D_XOPEN_SOURCE=700 -D_BSD_SOURCE
+CPPFLAGS += -D_BSD_SOURCE -D_GNU_SOURCE -D_DEFAULT_SOURCE
 LDFLAGS += -ldl -lm $(PKGCFG_L) $(LJABBER)
 
 
