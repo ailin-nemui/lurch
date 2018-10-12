@@ -649,7 +649,7 @@ static int lurch_bundle_publish_own(SERVER_REC * server) {
   g_warning("pre_key bundle: ##%s##", bundle_xml);
   //publish_node_bundle_p = xmlnode_from_str(bundle_xml, -1);
   //jabber_pep_publish(js_p, publish_node_bundle_p);
-  signal_emit("lurch send bundle", 3, server, uname, bundle_xml);
+  signal_emit("lurch peppublish bundle", 3, server, uname, bundle_xml);
 
   debug_info("lurch", "%s: published own bundle for %s\n", __func__, uname);
 
@@ -909,7 +909,7 @@ static void lurch_bundle_request_cb(SERVER_REC * server, const char * from,
     //msg_node_p = xmlnode_from_str(msg_xml, -1);
 
     debug_info("lurch", "sending encrypted msg\n");
-    signal_emit("lurch send message", 2, server, msg_xml);
+    signal_emit("lurch send message", 3, server, uname, msg_xml);
     //purple_signal_emit(purple_plugins_find_with_id("prpl-jabber"), "jabber-sending-xmlnode", ""/*js_p->gc*/, &msg_node_p);
 
     lurch_queued_msg_destroy(qmsg_p);
@@ -938,6 +938,7 @@ typedef void (*PepCallbackFunc)(SERVER_REC *, const char *, LmMessageNode *);
 
 static void irssi_lurch_peprequest_cb(SERVER_REC * server, LmMessage * lmsg, int type, const char * id, const char * from, const char * to)
 {
+  g_warning("incoming peprequest_cb - id: ##%s##", id);
   void * callback_p = g_hash_table_lookup(lurch_peprequest_response_ht, id);
   if (callback_p) {
     LmMessageNode * items = (void *) 0;
@@ -1029,6 +1030,9 @@ static int lurch_bundle_request_do(SERVER_REC * server,
   debug_info("lurch", "%s: ...request sent\n", __func__);
 
 cleanup:
+  if (jiq_p) {
+    lm_message_unref(jiq_p);
+  }
   g_free(uname);
   g_free(device_id_str);
   g_free(rand_str);
@@ -1329,7 +1333,7 @@ static void lurch_pep_own_devicelist_request_handler(SERVER_REC * server, const 
       goto cleanup;
     }
 
-    signal_emit("lurch send devicelist", 3, server, from, dl_xml);
+    signal_emit("lurch peppublish devicelist", 3, server, from, dl_xml);
     // publish_node_dl_p = xmlnode_from_str(dl_xml, -1);
     // jabber_pep_publish(js_p, publish_node_dl_p);
 
@@ -2177,6 +2181,8 @@ static void lurch_message_decrypt(SERVER_REC * server, LmMessage * lmsg, int typ
 
 
 cleanup:
+  mxmlRelease(plaintext_msg_node_p);
+
   if (err_msg_dbg) {
     printtext(server, from, MSGLEVEL_CLIENTERROR, "[lurch] %s", err_msg_dbg /* LURCH_ERR_STRING_DECRYPT */);
     debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
@@ -2491,7 +2497,7 @@ static void lurch_cmd_func(const char * data, SERVER_REC * server, WI_ITEM_REC *
       }
 
       uninstall = 1;
-      signal_emit("lurch send devicelist", 3, server, uname, temp_msg_1);
+      signal_emit("lurch peppublish devicelist", 3, server, uname, temp_msg_1);
 
       //dl_node_p = xmlnode_from_str(temp_msg_1, -1);
       //jabber_pep_publish(purple_connection_get_protocol_data(purple_conversation_get_gc(conv_p)), dl_node_p);
@@ -2708,7 +2714,7 @@ static void lurch_cmd_func(const char * data, SERVER_REC * server, WI_ITEM_REC *
                 goto cleanup;
               }
 
-	      signal_emit("lurch send devicelist", 3, server, uname, temp_msg_1);
+	      signal_emit("lurch peppublish devicelist", 3, server, uname, temp_msg_1);
               //dl_node_p = xmlnode_from_str(temp_msg_1, -1);
               //jabber_pep_publish(purple_connection_get_protocol_data(purple_conversation_get_gc(conv_p)), dl_node_p);
 
@@ -2785,6 +2791,32 @@ cleanup:
   }
 }
 
+static void irssi_lurch_peppublish(SERVER_REC * server, const char * from, const char * xml)
+{
+  LmMessage * msg = lm_message_new_with_sub_type(NULL, LM_MESSAGE_TYPE_IQ, LM_MESSAGE_SUB_TYPE_SET);
+  LmMessageNode * pubsub_node_p = lm_message_node_add_child(msg->node, "pubsub", NULL);
+  lm_message_node_set_attribute(pubsub_node_p, "xmlns", "http://jabber.org/protocol/pubsub");
+
+  lm_message_node_set_raw_mode(pubsub_node_p, TRUE);
+  lm_message_node_set_value(pubsub_node_p, xml);
+
+  signal_emit("xmpp send iq", 2, server, msg);
+
+  lm_message_unref(msg);
+}
+
+static void irssi_lurch_send(SERVER_REC * server, const char * from, const char * xml)
+{
+  mxml_node_t * xml_p = (void *) 0;
+
+  xml_p = mxmlLoadString((void *) 0, xml, MXML_OPAQUE_CALLBACK);
+
+  g_warning("sending xml: ##%s##", xml);
+  //signal_emit("xmpp send others", server, /*LmMessage */ message);
+
+  mxmlRelease(xml_p);
+}
+
 static void irssi_lurch_peprequest(SERVER_REC * server, const char * to, const char * node, void * callback_fn)
 {
   LmMessage * jiq_p = lm_message_new_with_sub_type(to, LM_MESSAGE_TYPE_IQ, LM_MESSAGE_SUB_TYPE_GET);
@@ -2812,7 +2844,8 @@ static void irssi_lurch_peprequest(SERVER_REC * server, const char * to, const c
   g_hash_table_insert(lurch_peprequest_response_ht, req_id, callback_fn);
   
   signal_emit("xmpp send iq", 2, server, jiq_p);
-  
+
+  lm_message_unref(jiq_p);
 }
 
 
@@ -2829,8 +2862,8 @@ void lurch_core_init(void)
   char * dl_ns = (void *) 0;
   GList * accs_l_p = (void *) 0;
 
-  lurch_bundle_request_ht = g_hash_table_new(NULL, g_str_equal);
-  lurch_peprequest_response_ht = g_hash_table_new(NULL, g_str_equal);
+  lurch_bundle_request_ht = g_hash_table_new(g_str_hash, g_str_equal);
+  lurch_peprequest_response_ht = g_hash_table_new(g_str_hash, g_str_equal);
 
   omemo_default_crypto_init();
 
@@ -2886,6 +2919,11 @@ void lurch_core_init(void)
   signal_add("lurch peprequest bundle", (SIGNAL_FUNC) irssi_lurch_peprequest);
   signal_add("lurch peprequest own_devicelist", (SIGNAL_FUNC) irssi_lurch_peprequest);
 
+  signal_add("lurch peppublish bundle", (SIGNAL_FUNC) irssi_lurch_peppublish);
+  signal_add("lurch send message", (SIGNAL_FUNC) irssi_lurch_send);
+  signal_add("lurch send keytransport", (SIGNAL_FUNC) irssi_lurch_send);
+  signal_add("lurch peppublish devicelist", (SIGNAL_FUNC) irssi_lurch_peppublish);
+
 cleanup:
   free(dl_ns);
   g_list_free(accs_l_p);
@@ -2898,8 +2936,6 @@ cleanup:
 
 void lurch_core_deinit(void)
 {
-  expando_destroy("encryption_omemo", (EXPANDO_FUNC) lurch_expando_encryption_omemo);
-
   signal_remove("server connected", (SIGNAL_FUNC) lurch_account_connect_cb);
   signal_remove("query created", (SIGNAL_FUNC) lurch_conv_created_cb);
   signal_remove("channel created", (SIGNAL_FUNC) lurch_conv_created_cb);
@@ -2909,6 +2945,11 @@ void lurch_core_deinit(void)
   signal_remove("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_iq_cb);
 
   omemo_default_crypto_teardown();
+
+  expando_destroy("encryption_omemo", (EXPANDO_FUNC) lurch_expando_encryption_omemo);
+
+  signal_remove("lurch peprequest bundle", (SIGNAL_FUNC) irssi_lurch_peprequest);
+  signal_remove("lurch peprequest own_devicelist", (SIGNAL_FUNC) irssi_lurch_peprequest);
 
   g_hash_table_unref(lurch_bundle_request_ht);
   g_hash_table_unref(lurch_peprequest_response_ht);
