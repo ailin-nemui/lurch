@@ -25,7 +25,7 @@ LIBPURPLE_CFLAGS=$(shell $(PKG_CONFIG) --cflags purple)
 LIBPURPLE_LDFLAGS=$(shell $(PKG_CONFIG) --cflags purple) \
 		    -L$(shell $(PKG_CONFIG) --variable=plugindir purple)
 
-IRSSI ?= /home/ailin/IRSSI_STUFF/irssi_inst/include
+IRSSI ?= /usr/include
 
 LOUDMOUTH_CFLAGS=$(shell $(PKG_CONFIG) --cflags loudmouth-1.0)
 
