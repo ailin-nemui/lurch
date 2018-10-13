@@ -988,7 +988,6 @@ static void irssi_lurch_bundle_request_cb(SERVER_REC * server, LmMessage * lmsg,
  * @param qmsg_p Pointer to the queued message waiting on (at least) this bundle.
  * @return 0 on success, negative on error.
  */
-// TODO
 static int lurch_bundle_request_do(SERVER_REC * server,
                                    const char * to,
                                    uint32_t device_id,
@@ -1611,7 +1610,6 @@ static int lurch_msg_finalize_encryption(SERVER_REC * server, axc_context * axc_
   }
 
   if (!no_sess_l_p) {
-    //LmMessageNodeAttribute * a = (void *) 0;
     ret_val = lurch_msg_encrypt_for_addrs(om_msg_p, addr_l_p, axc_ctx_p);
     if (ret_val) {
       err_msg_dbg = g_strdup_printf("failed to encrypt symmetric key for addrs");
@@ -1625,20 +1623,10 @@ static int lurch_msg_finalize_encryption(SERVER_REC * server, axc_context * axc_
     }
 
     omemo_message_destroy(om_msg_p);
-    
-    //temp_node_p = xmlnode_from_str(xml, -1);
-    lm_message_node_set_raw_mode(lmsg->node, TRUE);
-    // for (a = lmsg->node->attributes; a; a = a->next) {
-    //   gchar *escaped;
-
-    //   escaped = g_markup_escape_text (a->value, -1);
-    //   g_free(a->value);
-    //   a->value = escaped;
-    // }
-    lm_message_node_set_value(lmsg->node, xml);
+    signal_stop_by_name("xmpp send message");
+    signal_emit("lurch send message", 3, server, NULL, xml);
     //*msg_stanza_pp = xml;
   } else {
-    LmMessageNode * l = (void *) 0;
     ret_val = lurch_queued_msg_create(om_msg_p, addr_l_p, no_sess_l_p, &qmsg_p);
     if (ret_val) {
       err_msg_dbg = g_strdup_printf("failed to create queued message");
@@ -1657,12 +1645,6 @@ static int lurch_msg_finalize_encryption(SERVER_REC * server, axc_context * axc_
                               qmsg_p);
 
     }
-    for (l = lmsg->node->children; l; ) {
-        LmMessageNode *next = l->next;
-        lm_message_node_unref(l);
-	l = next;
-    }
-    lmsg->node->children = NULL;
     //*msg_stanza_pp = (void *) 0;
     signal_stop_by_name("xmpp send message");
   }
@@ -2327,7 +2309,7 @@ static char * lurch_expando_encryption_omemo(SERVER_REC * server, WI_ITEM_REC * 
   int ret_val = 0;
 
   char * uname = (void *) 0;
-  char * partner_name = lurch_irssi_conversation_get_name(item);
+  char * partner_name = (void *) 0;
   char * partner_name_bare = (void *) 0;
   axc_context * axc_ctx_p = (void *) 0;
   char * db_fn_omemo = (void *) 0;
@@ -2335,6 +2317,11 @@ static char * lurch_expando_encryption_omemo(SERVER_REC * server, WI_ITEM_REC * 
 
   char * new_title = (void *) 0;
 
+  if (server == NULL || item == NULL) {
+    goto cleanup;
+  }
+
+  partner_name = lurch_irssi_conversation_get_name(item);
   uname = lurch_get_account(server, item);
   db_fn_omemo = lurch_uname_get_db_fn(uname, LURCH_DB_NAME_OMEMO);
   partner_name_bare = lurch_get_bare_jid(partner_name);
@@ -2384,7 +2371,7 @@ cleanup:
     *free_ret = TRUE;
   }
 
-  return new_title;
+  return new_title ? new_title : "";
 }
 
 static void lurch_conv_created_cb(WI_ITEM_REC * item, gboolean automatic) {
