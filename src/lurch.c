@@ -828,7 +828,7 @@ static void lurch_bundle_request_cb(SERVER_REC * server, const char * from,
   uname = lurch_get_account(server, NULL);
   recipient = omemo_message_get_recipient_name_bare(qmsg_p->om_msg_p);
 
-  if (!from) {
+  if (!from || !*from) {
     // own user
     from = uname;
   }
@@ -1405,14 +1405,30 @@ cleanup:
   omemo_devicelist_destroy(dl_in_p);
 }
 
+static void irssi_lurch_message_cb(SERVER_REC * server, LmMessage * lmsg, int type, const char * id, const char * from, const char * to)
+{
+  LmMessageNode * event = lm_message_node_get_child(lmsg->node, "event");
+  if (event) {
+    LmMessageNode * items = lm_message_node_get_child(event, "items");
+    if (items) {
+      const char * node = lm_message_node_get_attribute(items, "node");
+      if (g_dl_ns != NULL && node != NULL && !g_strcmp0(node, g_dl_ns)) {
+	lurch_pep_devicelist_event_handler(server, from, items);
+      }
+    }
+  }
+}
+
 static void irssi_lurch_iq_cb(SERVER_REC * server, LmMessage * lmsg, int type, const char * id, const char * from, const char * to)
 {
-  LmMessageNode * events = lm_message_node_get_child(lmsg->node, "events");
-  if (events) {
-    LmMessageNode * items = lm_message_node_get_child(events, "items");
-    const char * node = lm_message_node_get_attribute(items, "node");
-    if (g_dl_ns != NULL && !g_strcmp0(node, g_dl_ns)) {
-      lurch_pep_devicelist_event_handler(server, from, items);
+  LmMessageNode * pubsub = lm_message_node_get_child(lmsg->node, "pubsub");
+  if (pubsub) {
+    LmMessageNode * items = lm_message_node_get_child(pubsub, "items");
+    if (items) {
+      const char * node = lm_message_node_get_attribute(items, "node");
+      if (g_dl_ns != NULL && node != NULL && !g_strcmp0(node, g_dl_ns)) {
+	lurch_pep_devicelist_event_handler(server, from, items);
+      }
     }
   }
 }
@@ -1635,12 +1651,14 @@ static int lurch_msg_finalize_encryption(SERVER_REC * server, axc_context * axc_
     }
     lmsg->node->children = NULL;
     //*msg_stanza_pp = (void *) 0;
+    signal_stop_by_name("xmpp send message");
   }
 
 cleanup:
   if (err_msg_dbg) {
     debug_error("lurch", "%s: %s (%i)\n", __func__, err_msg_dbg, ret_val);
     free(err_msg_dbg);
+    signal_stop_by_name("xmpp send message");
     //*msg_stanza_pp = (void *) 0;
   }
   if (!qmsg_p || ret_val) {
@@ -1676,7 +1694,8 @@ static void lurch_message_encrypt_im(SERVER_REC *server, LmMessage *lmsg)
   char * recipient = (void *) 0;
   char * tempxml = (void *) 0;
 
-  recipient = lurch_get_bare_jid(lm_message_node_get_attribute(lmsg->node, "to"));
+  const char * lm_to = lm_message_node_get_attribute(lmsg->node, "to");
+  recipient = lurch_get_bare_jid(lm_to);
 
   uname = lurch_get_account(server, NULL);
   db_fn_omemo = lurch_uname_get_db_fn(uname, LURCH_DB_NAME_OMEMO);
@@ -1732,7 +1751,7 @@ static void lurch_message_encrypt_im(SERVER_REC *server, LmMessage *lmsg)
       err_msg_dbg = g_strdup_printf("failed to check if session exists for %s in %s's db\n", to, uname);
       goto cleanup;
     } else if (ret_val == 1) {
-      printtext(server, recipient, MSGLEVEL_CLIENTNOTICE, "[lurch] %s", "Even though an encrypted session exists, the recipient's devicelist is empty."
+      printtext(server, lm_to, MSGLEVEL_CLIENTNOTICE, "[lurch] %s", "Even though an encrypted session exists, the recipient's devicelist is empty."
 		"The user probably uninstalled OMEMO, so you can add this conversation to the blacklist.");
     } else {
       goto cleanup;
@@ -2323,6 +2342,8 @@ static char * lurch_expando_encryption_omemo(SERVER_REC * server, WI_ITEM_REC * 
   ret_val = axc_session_exists_any(partner_name_bare, axc_ctx_p);
   if (ret_val < 0) {
     goto cleanup;
+  } else if (ret_val == 1) {
+    new_title = g_strdup("OMEMO not initialised");
   } else if (ret_val) {
     new_title = g_strdup("OMEMO");
 
@@ -2334,6 +2355,8 @@ static char * lurch_expando_encryption_omemo(SERVER_REC * server, WI_ITEM_REC * 
 
     if (!omemo_devicelist_is_empty(dl_p)) {
       new_title = g_strdup_printf("OMEMO available");
+    } else {
+      new_title = g_strdup("OMEMO not initialised*");
     }
   }
 
@@ -2514,6 +2537,7 @@ static void lurch_cmd_func(const char * data, SERVER_REC * server, WI_ITEM_REC *
                    "In conversations with one user:\n"
                    " - '/lurch blacklist add': Adds conversation partner to blacklist.\n"
                    " - '/lurch blacklist remove': Removes conversation partner from blacklist.\n"
+                   " - '/lurch init': Initialise OMEMO connection to partner.\n"
                    " - '/lurch show id own': Displays this device's ID.\n"
                    " - '/lurch show id list': Displays this account's devicelist.\n"
                    " - '/lurch show fp own': Displays this device's key fingerprint.\n"
@@ -2727,8 +2751,15 @@ static void lurch_cmd_func(const char * data, SERVER_REC * server, WI_ITEM_REC *
           msg = g_strdup("Valid argument for 'lurch remove' is 'id'.");
         }
 
+      } else if (!g_strcmp0(args[0], "init")) {
+	if (g_dl_ns != NULL) {
+	  conversation_jid = lurch_irssi_conversation_get_name(item);
+          temp_msg_1 = lurch_get_bare_jid(conversation_jid);
+	  msg = g_strdup_printf("requesting OMEMO devicelist from %s\n", temp_msg_1);
+	  signal_emit("lurch peprequest devicelist", 4, server, temp_msg_1, g_dl_ns, lurch_pep_devicelist_event_handler);
+	}
       } else {
-        msg = g_strdup("Valid arguments for 'lurch' in IMs are 'show', 'remove', 'blacklist', 'uninstall', and 'help'.");
+        msg = g_strdup("Valid arguments for 'lurch' in IMs are 'init', 'show', 'remove', 'blacklist', 'uninstall', and 'help'.");
       }
     } else if (IS_CHANNEL(item)) {
       if (!g_strcmp0(args[0], "enable")) {
@@ -2919,12 +2950,19 @@ void lurch_core_init(void)
   settings_add_bool("misc", LURCH_PREF_AXC_LOGGING, TRUE);
   settings_add_choice("misc", LURCH_PREF_AXC_LOGGING_LEVEL, 4, "error;warning;notice;info;debug");
 
+  expando_create("encryption_omemo", (EXPANDO_FUNC) lurch_expando_encryption_omemo,
+		 "window changed", EXPANDO_ARG_NONE,
+		 "window item changed", EXPANDO_ARG_WINDOW,
+		 "lurch encryption changed", EXPANDO_ARG_WINDOW_ITEM,
+		 NULL);
+
   command_bind("lurch", NULL, (SIGNAL_FUNC) lurch_cmd_func);
   signal_add("xmpp recv message", (SIGNAL_FUNC) lurch_xml_received_cb);
   signal_add("xmpp send message", (SIGNAL_FUNC) lurch_xml_sent_cb);
 
   signal_add("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_bundle_request_cb);
   signal_add("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_peprequest_cb);
+  signal_add("xmpp recv message", (SIGNAL_FUNC) irssi_lurch_message_cb);
   signal_add("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_iq_cb);
 
   // too early :(
@@ -2953,14 +2991,9 @@ void lurch_core_init(void)
   signal_add("channel created", (SIGNAL_FUNC) lurch_conv_created_cb);
   // (void) purple_signal_connect(purple_conversations_get_handle(), "conversation-updated", plugin_p, PURPLE_CALLBACK(lurch_conv_updated_cb), NULL);
 
-  expando_create("encryption_omemo", (EXPANDO_FUNC) lurch_expando_encryption_omemo,
-		 "window changed", EXPANDO_ARG_NONE,
-		 "window item changed", EXPANDO_ARG_WINDOW,
-		 "lurch encryption changed", EXPANDO_ARG_WINDOW_ITEM,
-		 NULL);
-
   signal_add("lurch peprequest bundle", (SIGNAL_FUNC) irssi_lurch_peprequest);
   signal_add("lurch peprequest own_devicelist", (SIGNAL_FUNC) irssi_lurch_peprequest);
+  signal_add("lurch peprequest devicelist", (SIGNAL_FUNC) irssi_lurch_peprequest);
 
   signal_add("lurch peppublish bundle", (SIGNAL_FUNC) irssi_lurch_peppublish);
   signal_add("lurch send message", (SIGNAL_FUNC) irssi_lurch_send);
@@ -2979,20 +3012,31 @@ cleanup:
 
 void lurch_core_deinit(void)
 {
+  command_unbind("lurch", (SIGNAL_FUNC) lurch_cmd_func);
+  signal_remove("xmpp recv message", (SIGNAL_FUNC) lurch_xml_received_cb);
+  signal_remove("xmpp send message", (SIGNAL_FUNC) lurch_xml_sent_cb);
+
+  signal_remove("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_bundle_request_cb);
+  signal_remove("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_peprequest_cb);
+  signal_remove("xmpp recv message", (SIGNAL_FUNC) irssi_lurch_message_cb);
+  signal_remove("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_iq_cb);
+
   signal_remove("server connected", (SIGNAL_FUNC) lurch_account_connect_cb);
   signal_remove("query created", (SIGNAL_FUNC) lurch_conv_created_cb);
   signal_remove("channel created", (SIGNAL_FUNC) lurch_conv_created_cb);
 
-  signal_remove("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_bundle_request_cb);
-  signal_remove("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_peprequest_cb);
-  signal_remove("xmpp recv iq", (SIGNAL_FUNC) irssi_lurch_iq_cb);
+  signal_remove("lurch peprequest bundle", (SIGNAL_FUNC) irssi_lurch_peprequest);
+  signal_remove("lurch peprequest own_devicelist", (SIGNAL_FUNC) irssi_lurch_peprequest);
+  signal_remove("lurch peprequest devicelist", (SIGNAL_FUNC) irssi_lurch_peprequest);
+
+  signal_remove("lurch peppublish bundle", (SIGNAL_FUNC) irssi_lurch_peppublish);
+  signal_remove("lurch send message", (SIGNAL_FUNC) irssi_lurch_send);
+  signal_remove("lurch send keytransport", (SIGNAL_FUNC) irssi_lurch_send);
+  signal_remove("lurch peppublish devicelist", (SIGNAL_FUNC) irssi_lurch_peppublish);
 
   omemo_default_crypto_teardown();
 
-  expando_destroy("encryption_omemo", (EXPANDO_FUNC) lurch_expando_encryption_omemo);
-
-  signal_remove("lurch peprequest bundle", (SIGNAL_FUNC) irssi_lurch_peprequest);
-  signal_remove("lurch peprequest own_devicelist", (SIGNAL_FUNC) irssi_lurch_peprequest);
+  //expando_destroy("encryption_omemo", (EXPANDO_FUNC) lurch_expando_encryption_omemo);
 
   g_hash_table_unref(lurch_bundle_request_ht);
   g_hash_table_unref(lurch_peprequest_response_ht);
