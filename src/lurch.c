@@ -314,6 +314,36 @@ static void lurch_axc_log_func(int level, const char * msg, size_t len, void * u
 }
 
 /**
+ * install the db only, for later use
+ */
+static int lurch_axc_create_db(axc_context * axc_ctx_p)
+{
+  int ret_val = 0;
+  char * err_msg_dbg = (void *) 0;
+  uint32_t device_id = 0;
+
+  ret_val = axc_get_device_id(axc_ctx_p, &device_id);
+  if (!ret_val) {
+    // already installed
+    goto cleanup;
+  }
+
+  ret_val = axc_db_create(axc_ctx_p);
+  if (ret_val){
+    err_msg_dbg = "failed to create db";
+    goto cleanup;
+  }
+
+ cleanup:
+  if (err_msg_dbg) {
+    debug_error("lurch", "%s: %s (%d)", __func__, err_msg_dbg, ret_val);
+    free(err_msg_dbg);
+  }
+
+  return ret_val;
+}
+
+/**
  * Creates and initializes the axc context.
  *
  * @param uname The username.
@@ -354,6 +384,11 @@ static int lurch_axc_get_init_ctx(char * uname, axc_context ** ctx_pp) {
 
   if (settings_get_bool(LURCH_PREF_AXC_LOGGING)) {
     signal_context_set_log_function(axc_context_get_axolotl_ctx(ctx_p), lurch_axc_log_func);
+  }
+
+  ret_val = lurch_axc_create_db(ctx_p);
+  if (ret_val) {
+    goto cleanup;
   }
 
   *ctx_pp = ctx_p;
