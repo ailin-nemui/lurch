@@ -125,6 +125,21 @@ static char * lurch_get_account(SERVER_REC * server, WI_ITEM_REC * item)
   return g_strconcat(server->connrec->username, "@", server->tag, NULL);
 }
 
+static char * lurch_fp_printable_x(const guchar * data, gsize len)
+{
+  int i;
+  gchar * out = (void *) 0;
+
+  out = g_malloc(len * 2 + len / 4 + 2);
+  for (i = 1; i < len; ++i) {
+    g_snprintf(&out[(i - 1) * 2 + (i - 1) / 4], 3, "%02hhx", data[i]);
+    if (i % 4 == 0) {
+      g_snprintf(&out[(i - 1) * 2 + (i - 1) / 4 + 2], 2, " ");
+    }
+  }
+  return out;
+}
+
 static void irssi_lurch_peppublish(SERVER_REC * server, const char * from, const char * xml)
 {
   LmMessage * msg = lm_message_new_with_sub_type(NULL, LM_MESSAGE_TYPE_IQ, LM_MESSAGE_SUB_TYPE_SET);
