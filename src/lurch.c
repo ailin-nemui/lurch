@@ -142,27 +142,7 @@ static char * lurch_queue_make_key_string_s(const char * name, const char * devi
  * @return The path string.
  */
 static char * lurch_uname_get_db_fn(const char * uname, char * which) {
-  return g_strconcat(purple_user_dir(), "/", uname, "_", which, LURCH_DB_SUFFIX, NULL);
-}
-
-/**
- * For some reason pidgin returns account names with a trailing "/".
- * This function removes it.
- * All other functions asking for the username assume the "/" is already stripped.
- *
- * @param uname The username.
- * @return A duplicated string with the trailing "/" removed. free() when done.
- */
-static char * lurch_uname_strip(const char * uname) {
-  char ** split;
-  char * stripped;
-
-  split = g_strsplit(uname, "/", 2);
-  stripped = g_strdup(split[0]);
-
-  g_strfreev(split);
-
-  return stripped;
+  return g_strconcat(USER_DIR(), "/", uname, "_", which, LURCH_DB_SUFFIX, NULL);
 }
 
 /**
@@ -223,9 +203,9 @@ static int lurch_axc_get_init_ctx(char * uname, axc_context ** ctx_pp) {
     goto cleanup;
   }
 
-  if (purple_prefs_get_bool(LURCH_PREF_AXC_LOGGING)) {
+  if (PREFS_GET_BOOL(LURCH_PREF_AXC_LOGGING)) {
       axc_context_set_log_func(ctx_p, lurch_axc_log_func);
-      axc_context_set_log_level(ctx_p, purple_prefs_get_int(LURCH_PREF_AXC_LOGGING_LEVEL));
+      axc_context_set_log_level(ctx_p, PREFS_GET_INT(LURCH_PREF_AXC_LOGGING_LEVEL));
   }
 
   ret_val = axc_init(ctx_p);
@@ -234,7 +214,7 @@ static int lurch_axc_get_init_ctx(char * uname, axc_context ** ctx_pp) {
     goto cleanup;
   }
 
-  if (purple_prefs_get_bool(LURCH_PREF_AXC_LOGGING)) {
+  if (PREFS_GET_BOOL(LURCH_PREF_AXC_LOGGING)) {
     signal_context_set_log_function(axc_context_get_axolotl_ctx(ctx_p), lurch_axc_log_func);
   }
 
