@@ -154,6 +154,11 @@ static char * lurch_uname_get_db_fn(const char * uname, char * which) {
  * @param ctx_p	the axc context
  */
 static void lurch_axc_log_func(int level, const char * msg, size_t len, void * user_data) {
+  int max_level = PREFS_GET_INT(LURCH_PREF_AXC_LOGGING_LEVEL);
+  if (level > max_level && level <= AXC_LOG_DEBUG) {
+    return;
+  }
+
   switch(level) {
     case AXC_LOG_ERROR:
       debug_error("lurch", "[AXC ERROR] %s", msg);
