@@ -485,7 +485,7 @@ static int lurch_bundle_publish_own(JabberStream * js_p) {
   char * bundle_xml = (void *) 0;
   xmlnode * publish_node_bundle_p = (void *) 0;
 
-  uname = lurch_uname_strip(purple_account_get_username(purple_connection_get_account(js_p->gc)));
+  uname = lurch_get_uname(js_p->gc);
 
   ret_val = lurch_axc_get_init_ctx(uname, &axc_ctx_p);
   if (ret_val) {
@@ -735,7 +735,7 @@ static void lurch_bundle_request_cb(JabberStream * js_p, const char * from,
   xmlnode * msg_node_p = (void *) 0;
   lurch_queued_msg * qmsg_p = (lurch_queued_msg *) data_p;
 
-  uname = lurch_uname_strip(purple_account_get_username(purple_connection_get_account(js_p->gc)));
+  uname = lurch_get_uname(js_p->gc);
   recipient = omemo_message_get_recipient_name_bare(qmsg_p->om_msg_p);
 
   if (!from) {
@@ -933,7 +933,7 @@ static void lurch_pep_bundle_for_keytransport(JabberStream * js_p, const char * 
   xmlnode * msg_node_p = (void *) 0;
   void * jabber_handle_p = purple_plugins_find_with_id("prpl-jabber");
 
-  uname = lurch_uname_strip(purple_account_get_username(purple_connection_get_account(js_p->gc)));
+  uname = lurch_get_uname(js_p->gc);
 
   addr.name = from;
   addr.name_len = strnlen(from, JABBER_MAX_LEN_BARE);
@@ -1256,7 +1256,7 @@ static void lurch_pep_devicelist_event_handler(JabberStream * js_p, const char *
   char * uname = (void *) 0;
   omemo_devicelist * dl_in_p = (void *) 0;
 
-  uname = lurch_uname_strip(purple_account_get_username(purple_connection_get_account(js_p->gc)));
+  uname = lurch_get_uname(js_p->gc);
   if (!strncmp(uname, from, strnlen(uname, JABBER_MAX_LEN_BARE))) {
     //own devicelist is dealt with in own handler
     lurch_pep_own_devicelist_request_handler(js_p, from, items_p);
@@ -1662,7 +1662,7 @@ static void lurch_message_encrypt_groupchat(PurpleConnection * gc_p, xmlnode ** 
 
   const char * to = xmlnode_get_attrib(*msg_stanza_pp, "to");
 
-  uname = lurch_uname_strip(purple_account_get_username(purple_connection_get_account(gc_p)));
+  uname = lurch_get_uname(gc_p);
   db_fn_omemo = lurch_uname_get_db_fn(uname, LURCH_DB_NAME_OMEMO);
 
   ret_val = omemo_storage_chatlist_exists(to, db_fn_omemo);
@@ -1854,7 +1854,7 @@ static void lurch_message_decrypt(PurpleConnection * gc_p, xmlnode ** msg_stanza
     goto cleanup;
   }
 
-  uname = lurch_uname_strip(purple_account_get_username(purple_connection_get_account(gc_p)));
+  uname = lurch_get_uname(gc_p);
   db_fn_omemo = lurch_uname_get_db_fn(uname, LURCH_DB_NAME_OMEMO);
 
   // on prosody and possibly other servers, messages to the own account do not have a recipient
@@ -2052,7 +2052,7 @@ static void lurch_message_warn(PurpleConnection * gc_p, xmlnode ** msg_stanza_pp
   const char * type = xmlnode_get_attrib(*msg_stanza_pp, "type");
   const char * from = xmlnode_get_attrib(*msg_stanza_pp, "from");
 
-  uname = lurch_uname_strip(purple_account_get_username(purple_connection_get_account(gc_p)));
+  uname = lurch_get_uname(gc_p);
   db_fn_omemo = lurch_uname_get_db_fn(uname, LURCH_DB_NAME_OMEMO);
 
   ret_val = lurch_axc_get_init_ctx(uname, &axc_ctx_p);

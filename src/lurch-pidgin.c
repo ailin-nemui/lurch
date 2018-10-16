@@ -53,6 +53,17 @@ static char * lurch_uname_strip(const char * uname) {
 }
 
 /**
+ * lurch_get_uname:
+ *
+ * @return (transfer full) (nullable):  The jabber account jid or the network tag. NULL on error
+ */
+static char * lurch_get_uname(JabberStream * js_p)
+{
+  return lurch_uname_strip(purple_account_get_username(purple_connection_get_account(js_p)));
+}
+
+
+/**
  * Actions to perform on plugin load.
  * Inits the crypto and registers signal and PEP handlers.
  */

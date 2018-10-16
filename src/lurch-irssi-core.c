@@ -46,6 +46,11 @@
   if (log_level >= AXC_LOG_ERROR)					\
     printtext(NULL, NULL, MSGLEVEL_CLIENTERROR, "[" a "][ERROR] " b , ##__VA_ARGS__)
 
+typedef struct _JabberStream {
+  SERVER_REC * gc;
+  WI_ITEM_REC * wi;
+} JabberStream;
+
 char * g_dl_ns = (void *) 0;
 int log_level = -1;
 
@@ -98,11 +103,11 @@ static char * lurch_irssi_conversation_get_name(WI_ITEM_REC * item)
 }
 
 /**
- * lurch_get_account:
+ * lurch_get_uname:
  *
  * @return (transfer full) (nullable):  The jabber account jid or the network tag. NULL on error
  */
-static char * lurch_get_account(SERVER_REC * server, WI_ITEM_REC * item)
+static char * lurch_get_uname(SERVER_REC * server, WI_ITEM_REC * item)
 {
   char * nick;
 
