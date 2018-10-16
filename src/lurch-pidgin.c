@@ -9,6 +9,8 @@
 
 #define JABBER_PROTOCOL_ID "prpl-jabber"
 
+#define LURCH_PRE_KEYS_AMOUNT AXC_PRE_KEYS_AMOUNT
+
 #define LURCH_PREF_ROOT              "/plugins/core/lurch"
 #define LURCH_PREF_AXC_LOGGING       LURCH_PREF_ROOT "/axc_logging"
 #define LURCH_PREF_AXC_LOGGING_LEVEL LURCH_PREF_AXC_LOGGING "/level"

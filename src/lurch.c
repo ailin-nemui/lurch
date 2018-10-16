@@ -493,7 +493,7 @@ static int lurch_bundle_publish_own(JabberStream * js_p) {
     goto cleanup;
   }
 
-  ret_val = axc_bundle_collect(AXC_PRE_KEYS_AMOUNT, axc_ctx_p, &axcbundle_p);
+  ret_val = axc_bundle_collect(LURCH_PRE_KEYS_AMOUNT, axc_ctx_p, &axcbundle_p);
   if (ret_val) {
     err_msg_dbg = g_strdup_printf("failed to collect axc bundle");
     goto cleanup;
