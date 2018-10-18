@@ -64,6 +64,13 @@ static char * lurch_get_uname(JabberStream * js_p)
   return lurch_uname_strip(purple_account_get_username(purple_connection_get_account(js_p)));
 }
 
+void lurch_peppublish_bundle(JabberStream * js_p, const char * uname, const char * bundle_xml)
+{
+  xmlnode * publish_node_bundle_p = (void *) 0;
+
+  publish_node_bundle_p = xmlnode_from_str(bundle_xml, -1);
+  jabber_pep_publish(js_p, publish_node_bundle_p);
+}
 
 /**
  * Actions to perform on plugin load.

@@ -483,7 +483,6 @@ static int lurch_bundle_publish_own(JabberStream * js_p) {
   axc_buf * curr_buf_p = (void *) 0;
   axc_buf_list_item * next_p = (void *) 0;
   char * bundle_xml = (void *) 0;
-  xmlnode * publish_node_bundle_p = (void *) 0;
 
   uname = lurch_get_uname(js_p->gc);
 
@@ -559,8 +558,7 @@ static int lurch_bundle_publish_own(JabberStream * js_p) {
     goto cleanup;
   }
 
-  publish_node_bundle_p = xmlnode_from_str(bundle_xml, -1);
-  jabber_pep_publish(js_p, publish_node_bundle_p);
+  lurch_peppublish_bundle(js_p, uname, bundle_xml);
 
   debug_info("lurch", "%s: published own bundle for %s", __func__, uname);
 

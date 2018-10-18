@@ -51,6 +51,8 @@ typedef struct _JabberStream {
   WI_ITEM_REC * wi;
 } JabberStream;
 
+#define JS_TO_SERVER(a) (a)->gc
+
 char * g_dl_ns = (void *) 0;
 int log_level = -1;
 
@@ -247,6 +249,12 @@ void irssi_lurch_read_settings(void)
 {
   log_level = settings_get_choice(LURCH_PREF_AXC_LOGGING_LEVEL) - 1;
 }
+
+void lurch_peppublish_bundle(JabberStream * js_p, const char * uname, const char * bundle_xml)
+{
+  signal_emit("lurch peppublish bundle", 3, JS_TO_SERVER(js_p), uname, bundle_xml);
+}
+
 
 /**
  * Actions to perform on plugin load.
